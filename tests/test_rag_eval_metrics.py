@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+import json
+
+from evals.apply_rag_review import apply_review
+from evals.build_rag_cases import _normalize_generated_case, _parse_json_array
+from evals.run_rag_eval import _parse_top_ks, _retrieval_metrics, load_cases
+
+
+def test_load_cases_supports_relevant_ids(tmp_path) -> None:
+    path = tmp_path / "cases.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "id": "case-1",
+                "question": "staff 去上海酒店标准是多少？",
+                "relevant_ids": ["doc-a", "doc-b"],
+                "keywords": ["800", "酒店"],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cases = load_cases(path)
+
+    assert cases[0].case_id == "case-1"
+    assert cases[0].relevant_ids == ["doc-a", "doc-b"]
+    assert cases[0].expected_doc_ids == ["doc-a", "doc-b"]
+
+
+def test_retrieval_metrics_calculates_precision_recall_hit() -> None:
+    results = [
+        {"id": "doc-a"},
+        {"id": "noise-1"},
+        {"id": "doc-b"},
+        {"id": "noise-2"},
+    ]
+
+    metrics = _retrieval_metrics(results, ["doc-a", "doc-b", "doc-c"], top_k=3)
+
+    assert metrics["hit@3"] is True
+    assert metrics["precision@3"] == 2 / 3
+    assert metrics["recall@3"] == 2 / 3
+
+
+def test_parse_top_ks_sorts_and_deduplicates() -> None:
+    assert _parse_top_ks("5,1,3,3", 5) == [1, 3, 5]
+
+
+def test_build_cases_parses_json_array_from_markdown() -> None:
+    parsed = _parse_json_array(
+        """
+        ```json
+        [{"question":"Q","expected_answer":"A","keywords":["K"]}]
+        ```
+        """
+    )
+
+    assert parsed == [{"question": "Q", "expected_answer": "A", "keywords": ["K"]}]
+
+
+def test_normalize_generated_case_binds_chunk_id() -> None:
+    doc = {
+        "id": "chunk-1",
+        "title": "policy",
+        "doc_type": "policy",
+        "content": "staff 酒店标准 800 CNY",
+    }
+
+    case = _normalize_generated_case(
+        {"question": "staff 酒店标准是多少？", "expected_answer": "800 CNY"},
+        doc,
+        1,
+    )
+
+    assert case is not None
+    assert case["relevant_ids"] == ["chunk-1"]
+    assert case["expected_doc_ids"] == ["chunk-1"]
+    assert "800 CNY" in case["source_content_preview"]
+
+
+def test_apply_rag_review_keeps_fixes_and_drops(tmp_path) -> None:
+    cases_path = tmp_path / "cases.jsonl"
+    cases_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"id": "keep", "question": "Q1", "relevant_ids": ["a"]}),
+                json.dumps({"id": "fix", "question": "Q2", "relevant_ids": ["b"]}),
+                json.dumps({"id": "drop", "question": "Q3", "relevant_ids": ["c"]}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    review_path = tmp_path / "review.csv"
+    review_path.write_text(
+        "\n".join(
+            [
+                "id,reviewer_decision,corrected_question,corrected_relevant_ids,notes",
+                "keep,keep,,,ok",
+                "fix,fix,Q2 corrected,\"[\"\"b\"\",\"\"d\"\"]\",needs another chunk",
+                "drop,drop,,,too broad",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    curated = apply_review(cases_path=cases_path, review_csv_path=review_path)
+
+    assert [item["id"] for item in curated] == ["keep", "fix"]
+    assert curated[0]["review"]["status"] == "approved"
+    assert curated[1]["question"] == "Q2 corrected"
+    assert curated[1]["relevant_ids"] == ["b", "d"]

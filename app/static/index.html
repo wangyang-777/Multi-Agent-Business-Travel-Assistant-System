@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>商旅 Agent Console</title>
+    <link rel="stylesheet" href="/app/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">旅</div>
+          <div>
+            <h1>商旅 Agent</h1>
+            <p>Console</p>
+          </div>
+        </div>
+        <nav class="nav" aria-label="主导航">
+          <button class="nav-item active" data-view="chat">Chat</button>
+          <button class="nav-item" data-view="history">History</button>
+          <button class="nav-item" data-view="knowledge">Knowledge</button>
+          <button class="nav-item" data-view="eval">RAG Eval</button>
+          <button class="nav-item" data-view="system">System</button>
+        </nav>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h2 id="view-title">Chat 工作台</h2>
+            <p id="view-subtitle">差旅规划、差标校验、审批提示与引用来源</p>
+          </div>
+          <div class="status-strip" id="status-strip">
+            <span class="status-dot muted"></span>
+            <span>Checking</span>
+          </div>
+        </header>
+
+        <section class="view active" id="view-chat">
+          <div class="chat-layout">
+            <section class="chat-panel">
+              <div class="session-bar">
+                <label>Session ID<input id="session-id" value="demo-1" /></label>
+                <label>最近会话
+                  <select id="recent-sessions">
+                    <option value="">选择历史会话</option>
+                  </select>
+                </label>
+                <button type="button" class="ghost" id="load-session-btn">加载历史</button>
+              </div>
+              <div class="messages" id="messages"></div>
+              <form class="composer" id="chat-form">
+                <textarea
+                  id="chat-input"
+                  rows="3"
+                  placeholder="输入差旅需求或政策问题"
+                ></textarea>
+                <div class="composer-actions">
+                  <button type="button" class="ghost" id="undo-btn" title="撤回上一轮">
+                    撤回上一轮
+                  </button>
+                  <button type="button" class="ghost" id="clear-btn" title="清空当前对话">
+                    清空
+                  </button>
+                  <button type="submit" class="primary" id="send-btn">发送</button>
+                </div>
+              </form>
+            </section>
+
+            <aside class="result-panel">
+              <div class="tabs">
+                <button class="tab active" data-tab="tables">Tables</button>
+                <button class="tab" data-tab="approval">Approval</button>
+                <button class="tab" data-tab="citations">Citations</button>
+                <button class="tab" data-tab="trace">Meta</button>
+              </div>
+              <div class="tab-page active" id="tab-tables"></div>
+              <div class="tab-page" id="tab-approval"></div>
+              <div class="tab-page" id="tab-citations"></div>
+              <div class="tab-page" id="tab-trace"></div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-history">
+          <div class="split-layout">
+            <section class="panel">
+              <div class="panel-head">
+                <h3>会话历史</h3>
+                <button class="ghost" id="refresh-sessions">刷新</button>
+              </div>
+              <div class="session-list" id="session-list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h3 id="history-title">历史详情</h3>
+                <button class="ghost" id="use-session-btn">载入到 Chat</button>
+              </div>
+              <div class="history-messages" id="history-messages"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-knowledge">
+          <div class="split-layout">
+            <section class="panel">
+              <div class="panel-head">
+                <h3>知识库</h3>
+                <div class="panel-actions">
+                  <button class="ghost" id="select-all-docs">全选</button>
+                  <button class="danger" id="delete-selected-docs">批量删除</button>
+                  <button class="ghost" id="refresh-docs">刷新</button>
+                </div>
+              </div>
+              <div class="form-status" id="doc-list-status"></div>
+              <div class="doc-list" id="doc-list"></div>
+            </section>
+            <section class="panel">
+              <h3>新增知识</h3>
+              <form class="stack-form" id="doc-form">
+                <label>标题<input id="doc-title" required /></label>
+                <label>类型
+                  <select id="doc-type">
+                    <option value="policy">policy</option>
+                    <option value="sop">sop</option>
+                    <option value="city_guide">city_guide</option>
+                    <option value="other">other</option>
+                  </select>
+                </label>
+                <label>文件上传<input id="doc-file" type="file" accept=".pdf,.docx,.pptx,.xlsx,.md,.txt,.html,.htm" /></label>
+                <label>内容<textarea id="doc-content" rows="8" placeholder="可粘贴文本；如果选择文件，将优先上传文件"></textarea></label>
+                <label class="check-row">
+                  <input type="checkbox" id="doc-long-mode" />
+                  <span>长文档分块入库 / 文件入库</span>
+                </label>
+                <div class="chunk-grid">
+                  <label>Chunk Size<input id="doc-chunk-size" type="number" min="200" max="3000" value="800" /></label>
+                  <label>Overlap<input id="doc-chunk-overlap" type="number" min="0" max="1000" value="120" /></label>
+                </div>
+                <button type="submit" class="primary" id="doc-submit">入库</button>
+                <div class="form-status" id="doc-status"></div>
+              </form>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-eval">
+          <section class="panel">
+            <div class="panel-head">
+              <h3>RAG 评测</h3>
+              <button class="primary" id="run-eval">运行评测</button>
+            </div>
+            <div class="metric-grid" id="eval-metrics"></div>
+            <div class="eval-table" id="eval-cases"></div>
+          </section>
+        </section>
+
+        <section class="view" id="view-system">
+          <section class="panel">
+            <div class="panel-head">
+              <h3>系统状态</h3>
+              <button class="ghost" id="refresh-health">刷新</button>
+            </div>
+            <div class="system-grid" id="system-grid"></div>
+          </section>
+        </section>
+      </main>
+    </div>
+    <script src="/app/app.js"></script>
+  </body>
+</html>

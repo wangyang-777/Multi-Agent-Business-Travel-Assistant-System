@@ -1,0 +1,4 @@
+{"id":"hotel-tier1-staff","question":"staff 去上海出差酒店标准是多少？","expected_doc_ids":["policy-hotel-tier1"],"keywords":["800","CNY","酒店"]}
+{"id":"advance-booking","question":"公司要求提前几天预订差旅行程？","expected_doc_ids":["policy-advance-booking"],"keywords":["提前","7","天"]}
+{"id":"staff-cabin","question":"staff 出差可以选择什么舱位？","expected_doc_ids":["policy-cabin-staff"],"keywords":["staff","economy","经济舱"]}
+{"id":"approval-threshold","question":"差旅金额超过多少需要事前审批？","expected_doc_ids":["policy-approval-threshold"],"keywords":["5000","审批"]}
