@@ -44,6 +44,10 @@ class TravelGraphState(TypedDict, total=False):
     execution_plan: dict[str, Any] | None
     policy_constraints: dict[str, Any] | None
     policy_validation: dict[str, Any] | None
+    travel_attempt: int
+    travel_retry_count: int
+    travel_retry_feedback: dict[str, Any] | None
+    travel_retry_exhausted: bool
     risk_level: str | None
     answer_mode: str | None
     verification: dict[str, Any] | None
@@ -72,6 +76,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         graph.add_node("rag_agent", self._rag_agent)
         graph.add_node("travel_react_agent", self._travel_react_agent)
         graph.add_node("policy_validator_agent", self._policy_validator_agent)
+        graph.add_node("travel_retry_agent", self._travel_retry_agent)
         graph.add_node("approval_agent", self._approval_agent)
         graph.add_node("general_agent", self._general_agent)
         graph.add_node("verification_agent", self._verification_agent)
@@ -105,6 +110,10 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             "execution_plan": None,
             "policy_constraints": None,
             "policy_validation": None,
+            "travel_attempt": 0,
+            "travel_retry_count": 0,
+            "travel_retry_feedback": None,
+            "travel_retry_exhausted": False,
             "risk_level": "low",
             "answer_mode": None,
             "verification": None,
@@ -409,6 +418,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         self, state: TravelGraphState
     ) -> Command[Literal["policy_validator_agent"]]:
         messages = list(state["openai_messages"])
+        attempt = int(state.get("travel_retry_count") or 0) + 1
         if state.get("execution_plan"):
             messages.append(
                 {
@@ -423,6 +433,23 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                     "role": "system",
                     "content": "制度约束（由 RAG Policy Reasoner 生成，必须优先遵守）：\n"
                     + json.dumps(state["policy_constraints"], ensure_ascii=False),
+                }
+            )
+        retry_feedback = state.get("travel_retry_feedback")
+        if attempt > 1 and retry_feedback:
+            max_attempts = max(1, int(settings.travel_validation_max_retries) + 1)
+            attempt_label = "最后一次自动尝试" if attempt >= max_attempts else "自动重试"
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"这是第 {attempt} 次候选生成（{attempt_label}）。"
+                        "上一轮候选未通过校验，必须根据反馈重新调用查询/推荐工具，"
+                        "优先选择满足制度约束且库存、价格信息完整的新候选；不得直接复用上一轮不合规组合。"
+                        "如果仍找不到合适方案，必须明确说明没有合规候选，不得编造库存。\n"
+                        "上一轮校验反馈：\n"
+                        + json.dumps(retry_feedback, ensure_ascii=False)
+                    ),
                 }
             )
         tools = _travel_tools()
@@ -461,6 +488,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                             "tool": tc.function.name,
                             "arguments": tc.function.arguments or "{}",
                             "output": output,
+                            "attempt": attempt,
                         }
                     )
                     messages.append(
@@ -476,11 +504,19 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 "answer": msg.content or "",
                 "usage": usage,
                 "tool_trace": tool_trace,
+                "travel_attempt": attempt,
                 "trace": self._append_trace(
                     state,
                     "travel_react_agent",
                     "answered",
-                    {"tool_calls": [t.get("tool") for t in tool_trace]},
+                    {
+                        "attempt": attempt,
+                        "tool_calls": [
+                            t.get("tool")
+                            for t in tool_trace
+                            if not isinstance(t, dict) or t.get("attempt") == attempt
+                        ],
+                    },
                 ),
             }
             return Command(update=update, goto="policy_validator_agent")
@@ -489,28 +525,27 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             "answer": "已达到最大推理轮次，请简化问题后重试。",
             "usage": usage,
             "tool_trace": tool_trace,
+            "travel_attempt": attempt,
             "risk_level": "medium",
-            "trace": self._append_trace(state, "travel_react_agent", "max_iterations"),
+            "trace": self._append_trace(
+                state,
+                "travel_react_agent",
+                "max_iterations",
+                {"attempt": attempt},
+            ),
         }
         return Command(update=update, goto="policy_validator_agent")
 
     async def _policy_validator_agent(
         self, state: TravelGraphState
-    ) -> Command[Literal["approval_agent"]]:
+    ) -> Command[Literal["travel_retry_agent"]]:
         draft = self._build_booking_draft(state)
         validation = self._build_policy_validation(state, draft)
-        risk_level = state.get("risk_level") or "low"
-        if validation.get("status") in {"failed", "needs_review"}:
-            risk_level = "high" if validation.get("violations") else "medium"
-        answer = state.get("answer", "")
-        if validation.get("summary") and validation.get("status") != "passed":
-            answer = f"{answer}\n\n合规校验：{validation['summary']}"
+        validation["attempt"] = int(state.get("travel_attempt") or 1)
         return Command(
             update={
-                "answer": answer,
                 "booking_draft": draft,
                 "policy_validation": validation,
-                "risk_level": risk_level,
                 "trace": self._append_trace(
                     state,
                     "policy_validator_agent",
@@ -518,6 +553,115 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                     {
                         "violations": len(validation.get("violations") or []),
                         "warnings": len(validation.get("warnings") or []),
+                    },
+                ),
+            },
+            goto="travel_retry_agent",
+        )
+
+    async def _travel_retry_agent(
+        self, state: TravelGraphState
+    ) -> Command[Literal["travel_react_agent", "approval_agent"]]:
+        validation = state.get("policy_validation") or {}
+        status = str(validation.get("status") or "needs_review")
+        retry_count = int(state.get("travel_retry_count") or 0)
+        max_retries = max(0, int(settings.travel_validation_max_retries))
+        retry_reasons = self._travel_retry_reasons(
+            state,
+            state.get("booking_draft"),
+            validation,
+        )
+
+        if status == "passed" and not retry_reasons:
+            return Command(
+                update={
+                    "travel_retry_feedback": None,
+                    "travel_retry_exhausted": False,
+                    "trace": self._append_trace(
+                        state,
+                        "travel_retry_agent",
+                        "validation_passed",
+                        {"attempt": state.get("travel_attempt", 1)},
+                    ),
+                },
+                goto="approval_agent",
+            )
+
+        if retry_reasons and retry_count < max_retries:
+            next_retry_count = retry_count + 1
+            feedback = {
+                "previous_attempt": state.get("travel_attempt", retry_count + 1),
+                "validation_status": status,
+                "reasons": retry_reasons,
+                "violations": validation.get("violations") or [],
+                "warnings": validation.get("warnings") or [],
+            }
+            return Command(
+                update={
+                    "travel_retry_count": next_retry_count,
+                    "travel_retry_feedback": feedback,
+                    "travel_retry_exhausted": False,
+                    "trace": self._append_trace(
+                        state,
+                        "travel_retry_agent",
+                        "retry_scheduled",
+                        {
+                            "retry": next_retry_count,
+                            "max_retries": max_retries,
+                            "reasons": retry_reasons,
+                        },
+                    ),
+                },
+                goto="travel_react_agent",
+            )
+
+        exhausted = bool(retry_reasons and retry_count >= max_retries and retry_count > 0)
+        answer = state.get("answer", "")
+        summary = validation.get("summary")
+        if summary:
+            answer = f"{answer}\n\n合规校验：{summary}"
+        if exhausted:
+            answer = (
+                f"{answer}\n\n自动重试：已完成 {retry_count} 次合规重试，仍未找到满足当前约束的完整方案，"
+                "已停止自动尝试并转人工审核。"
+            )
+        validation = dict(validation)
+        if retry_reasons and status == "passed":
+            status = "needs_review"
+            validation["status"] = status
+            validation["summary"] = "候选完整性检查未通过，自动重试后仍需人工复核。"
+        validation["retry"] = {
+            "count": retry_count,
+            "max_retries": max_retries,
+            "exhausted": exhausted,
+            "reasons": retry_reasons,
+        }
+        manual_review_required = bool(
+            exhausted
+            or status == "failed"
+            or (state.get("booking_draft") is not None and status == "needs_review")
+        )
+        return Command(
+            update={
+                "answer": answer,
+                "policy_validation": validation,
+                "risk_level": "high" if manual_review_required else "medium",
+                "travel_retry_exhausted": exhausted,
+                "travel_retry_feedback": {
+                    "validation_status": status,
+                    "reasons": retry_reasons,
+                    "violations": validation.get("violations") or [],
+                    "warnings": validation.get("warnings") or [],
+                },
+                "trace": self._append_trace(
+                    state,
+                    "travel_retry_agent",
+                    "retry_exhausted" if exhausted else "manual_review_required",
+                    {
+                        "retry_count": retry_count,
+                        "max_retries": max_retries,
+                        "status": status,
+                        "reasons": retry_reasons,
                     },
                 ),
             },
@@ -529,6 +673,14 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
     ) -> Command[Literal["reflection_agent", "finalizer_agent"]]:
         draft = state.get("booking_draft") or self._build_booking_draft(state)
         form = self._build_approval_form(state, draft)
+        validation = state.get("policy_validation") or {}
+        force_manual_review = bool(
+            state.get("travel_retry_exhausted")
+            or validation.get("status") == "failed"
+            or (draft is not None and validation.get("status") == "needs_review")
+        )
+        if force_manual_review:
+            form = self._force_manual_review_form(state, form, draft, validation)
         answer = state.get("answer", "")
         risk_level = "high" if form and form.get("required") else state.get("risk_level") or "low"
         if draft:
@@ -618,7 +770,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
     async def _finalizer_agent(self, state: TravelGraphState) -> dict[str, Any]:
         answer = self._enforce_enterprise_answer_contract(
             state.get("answer", ""),
-            state.get("tool_trace") or [],
+            self._current_attempt_tool_trace(state),
             state.get("effective_messages", state["messages"]),
         )
         session_id = state.get("session_id")
@@ -645,6 +797,12 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                     "execution_plan": state.get("execution_plan"),
                     "policy_constraints": state.get("policy_constraints"),
                     "policy_validation": state.get("policy_validation"),
+                    "travel_retry": {
+                        "attempts": state.get("travel_attempt", 0),
+                        "retry_count": state.get("travel_retry_count", 0),
+                        "exhausted": bool(state.get("travel_retry_exhausted")),
+                        "feedback": state.get("travel_retry_feedback"),
+                    },
                     "reflection": state.get("reflection_notes"),
                     "trace": self._append_trace(state, "finalizer_agent", "completed"),
                     "citations": state.get("citations") or [],
@@ -1160,11 +1318,140 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         return terms
 
     @staticmethod
+    def _current_attempt_tool_trace(state: TravelGraphState) -> list[dict[str, Any]]:
+        tool_trace = [item for item in state.get("tool_trace") or [] if isinstance(item, dict)]
+        if not any("attempt" in item for item in tool_trace):
+            return tool_trace
+        attempt = int(state.get("travel_attempt") or 1)
+        return [item for item in tool_trace if item.get("attempt") == attempt]
+
+    @staticmethod
+    def _travel_retry_reasons(
+        state: TravelGraphState,
+        booking_draft: dict[str, Any] | None,
+        validation: dict[str, Any],
+    ) -> list[str]:
+        reasons: list[str] = []
+
+        def add(reason: str) -> None:
+            text = reason.strip()
+            if text and text not in reasons:
+                reasons.append(text)
+
+        tool_trace = LangGraphTravelOrchestrator._current_attempt_tool_trace(state)
+        if not tool_trace:
+            add("本轮未执行任何旅行查询或推荐工具，无法形成可校验候选")
+
+        for item in tool_trace:
+            tool_name = str(item.get("tool") or "")
+            output = item.get("output")
+            if not isinstance(output, str):
+                if tool_name.startswith("search_") or tool_name == "recommend_travel_options":
+                    add(f"{tool_name} 未返回可解析结果")
+                continue
+            try:
+                payload = json.loads(output)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            mode = str(payload.get("mode") or "")
+            if payload.get("error"):
+                add(f"{tool_name or mode} 查询失败：{payload['error']}")
+            if mode in {"flight", "hotel", "train"}:
+                results = payload.get("results")
+                if not isinstance(results, list) or not any(
+                    isinstance(row, dict) for row in results
+                ):
+                    add(f"{mode} 查询未找到可用候选")
+            elif mode == "travel_recommendation":
+                flights = [row for row in payload.get("flights") or [] if isinstance(row, dict)]
+                trains = [row for row in payload.get("trains") or [] if isinstance(row, dict)]
+                hotels = [row for row in payload.get("hotels") or [] if isinstance(row, dict)]
+                raw_query = payload.get("query")
+                query: dict[str, Any] = dict(raw_query) if isinstance(raw_query, dict) else {}
+                include_trains = bool(query.get("include_trains", True))
+                if not flights and (not include_trains or not trains):
+                    add("综合推荐未找到可用的航班或火车交通候选")
+                if not hotels:
+                    add("综合推荐未找到可用酒店候选")
+
+        retryable_checks = {"酒店差标", "航班舱位", "高铁/火车席别"}
+        for check in validation.get("checks") or []:
+            if not isinstance(check, dict):
+                continue
+            name = str(check.get("name") or "")
+            status = str(check.get("status") or "")
+            detail = str(check.get("detail") or "")
+            if name in retryable_checks and status in {"failed", "unknown"}:
+                add(detail or f"{name}未通过")
+            elif name == "审批阈值" and status == "unknown" and booking_draft:
+                add(detail or "候选价格不完整，无法校验审批阈值")
+        for violation in validation.get("violations") or []:
+            text = str(violation).strip()
+            if any(keyword in text for keyword in ("酒店", "舱位", "席别", "超出差标", "超过差标", "不符合")):
+                add(text)
+        return reasons
+
+    @staticmethod
+    def _force_manual_review_form(
+        state: TravelGraphState,
+        form: dict[str, Any] | None,
+        booking_draft: dict[str, Any] | None,
+        validation: dict[str, Any],
+    ) -> dict[str, Any]:
+        draft = booking_draft or {}
+        slots_payload = state.get("execution_plan") or {}
+        slots = slots_payload.get("slots") if isinstance(slots_payload, dict) else {}
+        slots = slots if isinstance(slots, dict) else {}
+        result = dict(form or {})
+        warnings = [
+            str(item)
+            for item in result.get("policy_warnings") or []
+            if str(item).strip()
+        ]
+        for item in [*(validation.get("violations") or []), *(validation.get("warnings") or [])]:
+            text = str(item).strip()
+            if text and text not in warnings:
+                warnings.append(text)
+        if state.get("travel_retry_exhausted"):
+            text = "自动合规重试已耗尽，仍未找到满足当前约束的完整方案"
+            if text not in warnings:
+                warnings.append(text)
+        result.update(
+            {
+                "required": True,
+                "status": "pending_human_approval",
+                "employee_id": result.get("employee_id")
+                or draft.get("employee_id")
+                or slots.get("employee_id"),
+                "grade": result.get("grade") or draft.get("grade") or slots.get("grade"),
+                "origin_city": result.get("origin_city")
+                or draft.get("origin_city")
+                or slots.get("origin_city"),
+                "destination_city": result.get("destination_city")
+                or draft.get("destination_city")
+                or slots.get("destination_city"),
+                "departure_date": result.get("departure_date")
+                or draft.get("departure_date")
+                or slots.get("departure_date"),
+                "return_date": result.get("return_date")
+                or draft.get("return_date")
+                or slots.get("return_date"),
+                "estimated_total_cny": result.get("estimated_total_cny")
+                or draft.get("estimated_total_cny"),
+                "reason": result.get("reason") or draft.get("purpose") or slots.get("purpose"),
+                "policy_warnings": warnings,
+            }
+        )
+        return result
+
+    @staticmethod
     def _build_approval_form(
         state: TravelGraphState,
         booking_draft: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        tool_trace = state.get("tool_trace") or []
+        tool_trace = LangGraphTravelOrchestrator._current_attempt_tool_trace(state)
         if not tool_trace:
             return None
         args: dict[str, Any] = {}
@@ -1222,7 +1509,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
 
     @staticmethod
     def _build_booking_draft(state: TravelGraphState) -> dict[str, Any] | None:
-        tool_trace = state.get("tool_trace") or []
+        tool_trace = LangGraphTravelOrchestrator._current_attempt_tool_trace(state)
         if not tool_trace:
             return None
 
@@ -1536,7 +1823,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         elif draft and advance_days:
             add_check("提前预订", "unknown", "缺少出发日期，无法校验提前预订要求")
 
-        for item in state.get("tool_trace") or []:
+        for item in LangGraphTravelOrchestrator._current_attempt_tool_trace(state):
             if not isinstance(item, dict) or not isinstance(item.get("output"), str):
                 continue
             for warning in LangGraphTravelOrchestrator._extract_policy_warnings(item["output"]):

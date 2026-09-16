@@ -102,6 +102,37 @@ def test_build_response_tables_from_travel_recommendation_json() -> None:
     assert tables[3].rows[0]["酒店"] == "上海商务精选酒店"
 
 
+def test_response_tables_only_show_latest_retry_attempt() -> None:
+    raw = {
+        "choices": [{"message": {"content": "已重试"}}],
+        "metadata": {
+            "tool_trace": [
+                {
+                    "attempt": 1,
+                    "tool": "search_flights",
+                    "output": (
+                        '{"mode":"flight","results":['
+                        '{"flight_no":"OLD1","origin":"北京","destination":"上海"}]}'
+                    ),
+                },
+                {
+                    "attempt": 2,
+                    "tool": "search_flights",
+                    "output": (
+                        '{"mode":"flight","results":['
+                        '{"flight_no":"NEW2","origin":"北京","destination":"上海"}]}'
+                    ),
+                },
+            ]
+        },
+    }
+
+    tables = _build_response_tables(raw)
+
+    assert [table.title for table in tables] == ["航班候选"]
+    assert tables[0].rows[0]["航班"] == "NEW2"
+
+
 def test_build_response_tables_from_booking_draft_metadata() -> None:
     raw = {
         "choices": [{"message": {"content": "文本回复仍然保留"}}],

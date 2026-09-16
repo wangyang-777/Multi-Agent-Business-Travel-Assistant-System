@@ -136,8 +136,14 @@ context_agent
 guardrail_agent
   ↓
 intent_agent
-  ├─ travel_react_agent
+  ├─ policy_reasoner_agent
   │    ↓
+  │  travel_react_agent
+  │    ↓
+  │  policy_validator_agent
+  │    ↓
+  │  travel_retry_agent ── 可修复且未重试 ──> travel_react_agent
+  │    ↓ 通过 / 重试耗尽
   │  approval_agent
   │    ↓
   │  reflection_agent（仅在用户要求复核/挑错时）
@@ -153,6 +159,8 @@ finalizer_agent
 - `guardrail_agent`：执行输入安全与流程边界检查，例如信息不足时阻断预订、拦截明显违规请求。
 - `intent_agent`：识别差旅行程、差标、预订、通用问题等意图，并路由到对应节点。
 - `travel_react_agent`：使用 OpenAI function calling 调用行程规划与差标校验工具。
+- `policy_validator_agent`：基于制度约束校验当前轮候选和预订草稿。
+- `travel_retry_agent`：在校验后判断是否携带违规原因重查候选，默认最多重试一次；仍失败时提升风险并要求人工审核。
 - `rag_agent`：对制度、政策、报销、审批等知识类问题检索 Milvus 知识库，并返回引用来源。
 - `approval_agent`：根据金额、差标 warning 和工具结果生成 `approval_form`，需要人工审批时标记 `pending_human_approval`。
 - `general_agent`：处理不需要差旅工具的普通对话。
@@ -163,6 +171,12 @@ finalizer_agent
 
 ```bash
 AGENT_ORCHESTRATOR_BACKEND=legacy
+```
+
+候选合规自动重试次数可配置，默认值为 1：
+
+```bash
+TRAVEL_VALIDATION_MAX_RETRIES=1
 ```
 
 ## 测试

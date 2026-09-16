@@ -102,6 +102,7 @@ class ChatResponse(BaseModel):
     execution_plan: Optional[dict[str, Any]] = None
     policy_constraints: Optional[dict[str, Any]] = None
     policy_validation: Optional[dict[str, Any]] = None
+    travel_retry: Optional[dict[str, Any]] = None
     trace: list[dict[str, Any]] = Field(default_factory=list)
     risk_level: Optional[Literal["low", "medium", "high"]] = None
     answer_mode: Optional[Literal["rag_grounded", "llm_fallback"]] = None

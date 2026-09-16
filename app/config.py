@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     # Agent config
     agent_orchestrator_backend: str = "langgraph"
     max_react_iterations: int = 10
+    travel_validation_max_retries: int = 1
     memory_window_size: int = 20
     memory_summary_threshold: int = 15
     memory_max_messages: int = 40

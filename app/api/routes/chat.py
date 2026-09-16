@@ -523,8 +523,16 @@ def _build_response_tables(raw: dict[str, Any]) -> list[ResponseTable]:
         tables.extend(_table_from_booking_draft(booking_draft))
 
     if isinstance(tool_trace, list):
+        attempt_values = [
+            int(item["attempt"])
+            for item in tool_trace
+            if isinstance(item, dict) and isinstance(item.get("attempt"), int)
+        ]
+        display_attempt = max(attempt_values) if attempt_values else None
         for item in tool_trace:
             if not isinstance(item, dict):
+                continue
+            if display_attempt is not None and item.get("attempt") != display_attempt:
                 continue
             output = item.get("output")
             if isinstance(output, str):
@@ -623,6 +631,7 @@ async def chat(
         execution_plan=metadata.get("execution_plan"),
         policy_constraints=metadata.get("policy_constraints"),
         policy_validation=metadata.get("policy_validation"),
+        travel_retry=metadata.get("travel_retry"),
         trace=metadata.get("trace") or [],
         risk_level=metadata.get("risk_level"),
         answer_mode=metadata.get("answer_mode"),

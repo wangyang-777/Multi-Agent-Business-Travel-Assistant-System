@@ -35,6 +35,7 @@ services:
       RAILWAY_MCP_URL: ${RAILWAY_MCP_URL:-}
       RAILWAY_MCP_TIMEOUT_S: ${RAILWAY_MCP_TIMEOUT_S:-30}
       AGENT_ORCHESTRATOR_BACKEND: ${AGENT_ORCHESTRATOR_BACKEND:-langgraph}
+      TRAVEL_VALIDATION_MAX_RETRIES: ${TRAVEL_VALIDATION_MAX_RETRIES:-1}
     depends_on:
       postgres:
         condition: service_healthy
