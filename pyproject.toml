@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "travel-agent-guide"
 version = "0.1.0"
-description = "Enterprise AI agent for business travel (商旅差旅助手)"
+description = "Enterprise AI workflow for business travel (商旅差旅助手)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
