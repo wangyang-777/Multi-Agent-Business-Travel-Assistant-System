@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """应用与 Agent 运行时配置（自环境变量与 `.env` 加载）。"""
+    """应用与工作流运行时配置（自环境变量与 `.env` 加载）。"""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -16,6 +16,14 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 1536
     embedding_max_tokens: int = 8192
     embedding_chunk_max_tokens: int = 7000
+    rag_keyword_top_k: int = 20
+    rag_vector_top_k: int = 20
+    rag_rrf_k: int = 60
+    rag_fused_top_k: int = 20
+    rag_final_top_k: int = 5
+    rag_reranker_enabled: bool = True
+    rag_reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    keyword_index_redis_key: str = "knowledge:keyword:chunks"
     travel_inventory_provider: str = "demo"
     amadeus_client_id: str = ""
     amadeus_client_secret: str = ""
@@ -34,7 +42,7 @@ class Settings(BaseSettings):
     milvus_port: int = 19530
     log_level: str = "INFO"
 
-    # Agent config
+    # Workflow config
     agent_orchestrator_backend: str = "langgraph"
     max_react_iterations: int = 10
     travel_validation_max_retries: int = 1

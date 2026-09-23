@@ -11,7 +11,7 @@ from app.core.intent.rule_engine import RuleEngine
 
 
 class TravelIntent(str, Enum):
-    """商旅子域意图（与子 Agent 路由对齐）。"""
+    """商旅子域意图（与工作流路由对齐）。"""
 
     SEARCH_FLIGHT = "search_flight"
     SEARCH_HOTEL = "search_hotel"

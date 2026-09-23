@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-import time
 import asyncio
 import json
 import os
-from datetime import date, datetime, time as dt_time, timedelta
+import re
+import time
+from datetime import date, datetime, timedelta
+from datetime import time as dt_time
 from decimal import Decimal
 from enum import Enum
-import re
 from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -176,10 +177,15 @@ def _extract_flyai_items(payload: Any) -> list[dict[str, Any]]:
 
 
 def _build_12306_skill_command(req: TrainSearchRequest) -> list[str]:
-    base_dir = Path(settings.railway_12306_skill_dir)
+    raw_base_dir = settings.railway_12306_skill_dir
+    script_path = (
+        f"{raw_base_dir.rstrip('/')}/scripts/query.mjs"
+        if raw_base_dir.startswith("/")
+        else str(Path(raw_base_dir) / "scripts" / "query.mjs")
+    )
     cmd = [
         settings.railway_12306_node_bin,
-        str(base_dir / "scripts" / "query.mjs"),
+        script_path,
         req.origin_station,
         req.dest_station,
         "-d",

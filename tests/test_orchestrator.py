@@ -1,4 +1,4 @@
-"""Unit tests for travel agent orchestrator."""
+"""Unit tests for the travel RAG orchestrator."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.core.agent.orchestrator import TravelAgentOrchestrator
+from app.core.agent.orchestrator import TravelRAGOrchestrator
 from app.core.intent.recognizer import TravelIntent
 from app.core.rag.generator import RAGAnswerGenerator
 from app.core.rag.retriever import MultiChannelRetriever, RetrievedChunk
@@ -59,7 +59,7 @@ async def test_orchestrator_runs_rag_and_generation() -> None:
     )
     gen = RAGAnswerGenerator(llm=llm)  # type: ignore[arg-type]
 
-    orch = TravelAgentOrchestrator(
+    orch = TravelRAGOrchestrator(
         retriever=retriever,
         generator=gen,
         embedder=_Embed(),

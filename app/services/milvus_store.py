@@ -165,7 +165,9 @@ class MilvusDocumentStore:
             )
         return hits
 
-    def list_documents(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def list_documents(
+        self, limit: int = 100, *, content_limit: int = 2000
+    ) -> List[Dict[str, Any]]:
         if not self._collection:
             raise RuntimeError("Milvus not connected")
         self._collection.load()
@@ -179,7 +181,7 @@ class MilvusDocumentStore:
                 "id": row.get("id"),
                 "title": row.get("title"),
                 "doc_type": row.get("doc_type"),
-                "content": str(row.get("content") or "")[:2000],
+                "content": str(row.get("content") or "")[:content_limit],
             }
             for row in rows
         ]

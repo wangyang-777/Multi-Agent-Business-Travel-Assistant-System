@@ -135,8 +135,8 @@
                   <span>长文档分块入库 / 文件入库</span>
                 </label>
                 <div class="chunk-grid">
-                  <label>Chunk Size<input id="doc-chunk-size" type="number" min="200" max="3000" value="800" /></label>
-                  <label>Overlap<input id="doc-chunk-overlap" type="number" min="0" max="1000" value="120" /></label>
+                  <label>语义块安全上限<input id="doc-chunk-size" type="number" min="200" max="12000" value="3000" /></label>
+                  <label>Overlap（固定 15%）<input id="doc-chunk-overlap" type="number" value="450" disabled /></label>
                 </div>
                 <button type="submit" class="primary" id="doc-submit">入库</button>
                 <div class="form-status" id="doc-status"></div>

@@ -273,7 +273,7 @@ async def test_validation_failure_schedules_one_travel_retry() -> None:
         "trace": [],
     }
 
-    command = await orch._travel_retry_agent(state)  # type: ignore[arg-type]
+    command = await orch._travel_retry_router(state)  # type: ignore[arg-type]
 
     assert command.goto == "travel_react_agent"
     assert command.update["travel_retry_count"] == 1
@@ -314,16 +314,16 @@ async def test_second_failed_attempt_requires_manual_review() -> None:
         "trace": [],
     }
 
-    command = await orch._travel_retry_agent(state)  # type: ignore[arg-type]
+    command = await orch._travel_retry_router(state)  # type: ignore[arg-type]
 
-    assert command.goto == "approval_agent"
+    assert command.goto == "approval_processor"
     assert command.update["travel_retry_exhausted"] is True
     assert command.update["risk_level"] == "high"
     assert command.update["policy_validation"]["retry"]["exhausted"] is True
     assert "转人工审核" in command.update["answer"]
 
     approval_state = {**state, **command.update}
-    approval = await orch._approval_agent(approval_state)  # type: ignore[arg-type]
+    approval = await orch._approval_processor(approval_state)  # type: ignore[arg-type]
     assert approval.update["approval_form"]["required"] is True
     assert approval.update["approval_form"]["status"] == "pending_human_approval"
 
@@ -356,9 +356,9 @@ async def test_passed_retry_continues_without_exhaustion() -> None:
         "trace": [],
     }
 
-    command = await orch._travel_retry_agent(state)  # type: ignore[arg-type]
+    command = await orch._travel_retry_router(state)  # type: ignore[arg-type]
 
-    assert command.goto == "approval_agent"
+    assert command.goto == "approval_processor"
     assert command.update["travel_retry_exhausted"] is False
 
 

@@ -31,6 +31,16 @@ async def health(request: Request) -> HealthStatus:
     else:
         checks["milvus"] = milvus.connected
 
+    keyword_index = getattr(request.app.state, "keyword_index", None)
+    if keyword_index is None:
+        checks["keyword_index"] = False
+    else:
+        try:
+            checks["keyword_index"] = bool(await keyword_index.ping())
+        except Exception as exc:
+            checks["keyword_index"] = False
+            detail_parts.append(f"keyword_index:{exc!s}")
+
     engine = getattr(request.app.state, "db_engine", None)
     if engine is None:
         checks["database"] = True
@@ -51,6 +61,8 @@ async def health(request: Request) -> HealthStatus:
     if not checks.get("redis", True) or not checks.get("database", True):
         status = "degraded"
     elif milvus is not None and not checks.get("milvus", True):
+        status = "degraded"
+    elif not checks.get("keyword_index", False):
         status = "degraded"
 
     return HealthStatus(

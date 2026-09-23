@@ -56,8 +56,8 @@ async def _dispatch(method: str | None, params: dict[str, Any], request: Request
             "resources": [
                 {
                     "uri": "travel-agent://health",
-                    "name": "Travel Agent Health",
-                    "description": "当前差旅 Agent 服务状态摘要。",
+                    "name": "Travel Workflow Health",
+                    "description": "当前智能差旅服务状态摘要。",
                     "mimeType": "application/json",
                 }
             ]

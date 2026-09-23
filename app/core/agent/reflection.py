@@ -1,6 +1,4 @@
-"""
-反思 Agent：对草稿输出进行评估并给出修订稿。
-"""
+"""响应审阅器：对草稿输出执行一次评估和修订。"""
 
 from __future__ import annotations
 
@@ -23,7 +21,7 @@ class ReflectionOutcome:
     passed: bool
 
 
-class ReflectionAgent:
+class ResponseReviewer:
     """
     根据标准对草稿进行审查，生成问题说明与修订文本。
 

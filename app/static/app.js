@@ -429,8 +429,8 @@ async function ingestDocument(event) {
     return;
   }
   if (longMode) {
-    payload.chunk_size = Number($("#doc-chunk-size").value || 800);
-    payload.chunk_overlap = Number($("#doc-chunk-overlap").value || 120);
+    payload.chunk_size = Number($("#doc-chunk-size").value || 3000);
+    payload.chunk_overlap = Math.round(payload.chunk_size * 0.15);
   }
   submit.disabled = true;
   status.innerHTML = `<span>正在解析、分块并写入向量库，长 PDF 可能需要几十秒...</span>`;
@@ -441,8 +441,8 @@ async function ingestDocument(event) {
       form.append("file", file);
       form.append("title", payload.title || file.name);
       form.append("doc_type", payload.doc_type);
-      form.append("chunk_size", String(payload.chunk_size || 800));
-      form.append("chunk_overlap", String(payload.chunk_overlap || 120));
+      form.append("chunk_size", String(payload.chunk_size || 3000));
+      form.append("chunk_overlap", String(payload.chunk_overlap || 450));
       result = await apiForm("/api/v1/documents/upload", form);
     } else {
       const path = longMode ? "/api/v1/documents/ingest-long" : "/api/v1/documents/ingest";
@@ -450,8 +450,8 @@ async function ingestDocument(event) {
     }
     status.innerHTML = `<span class="pass">入库成功：${escapeHtml(result.chunk_count || 1)} 个 chunk，doc_id=${escapeHtml(result.doc_id)}</span>`;
     $("#doc-form").reset();
-    $("#doc-chunk-size").value = "800";
-    $("#doc-chunk-overlap").value = "120";
+    $("#doc-chunk-size").value = "3000";
+    $("#doc-chunk-overlap").value = "450";
     await loadDocuments();
   } catch (error) {
     status.innerHTML = `<span class="fail">入库失败：${escapeHtml(error.message)}</span>`;

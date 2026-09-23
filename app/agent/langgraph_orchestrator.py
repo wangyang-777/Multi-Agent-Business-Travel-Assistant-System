@@ -8,18 +8,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, TypedDict
 from zoneinfo import ZoneInfo
 
+from langgraph.types import Command
+
 from app.agent.orchestrator import (
     TravelOrchestrator,
-    _to_openai_messages,
     _runtime_system_prompt,
+    _to_openai_messages,
     _travel_tools,
 )
 from app.config import settings
 from app.core.intent.recognizer import IntentRecognizer, TravelIntent
 from app.domain.schemas import ChatMessage, MessageRole
 from app.services.embeddings import EmbeddingService
-
-from langgraph.types import Command
+from app.services.keyword_index import tokenize_for_keyword_search
 
 
 class TravelGraphState(TypedDict, total=False):
@@ -51,47 +52,55 @@ class TravelGraphState(TypedDict, total=False):
     risk_level: str | None
     answer_mode: str | None
     verification: dict[str, Any] | None
+    claim_evidence_map: list[dict[str, Any]]
+    rag_correction_count: int
     reflection_notes: str
 
 
 class LangGraphTravelOrchestrator(TravelOrchestrator):
-    """LangGraph-backed multi-agent orchestration with the legacy chat API shape."""
+    """LangGraph workflow with one tool-using ReAct agent and supporting nodes."""
 
-    def __init__(self, *args: Any, document_store: Any | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        document_store: Any | None = None,
+        rag_retriever: Any | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._intent = IntentRecognizer()
         self._document_store = document_store
+        self._rag_retriever = rag_retriever
         self._graph = self._build_graph()
 
     def _build_graph(self) -> Any:
         from langgraph.graph import END, START, StateGraph
 
         graph = StateGraph(TravelGraphState)
-        graph.add_node("context_agent", self._context_agent)
-        graph.add_node("memory_fusion_agent", self._memory_fusion_agent)
-        graph.add_node("guardrail_agent", self._guardrail_agent)
-        graph.add_node("planner_agent", self._planner_agent)
-        graph.add_node("intent_agent", self._intent_agent)
-        graph.add_node("policy_reasoner_agent", self._policy_reasoner_agent)
-        graph.add_node("rag_agent", self._rag_agent)
+        graph.add_node("context_builder", self._context_builder)
+        graph.add_node("memory_fusion", self._memory_fusion)
+        graph.add_node("input_guardrail", self._input_guardrail)
+        graph.add_node("planner", self._planner)
+        graph.add_node("intent_router", self._intent_router)
+        graph.add_node("policy_reasoner", self._policy_reasoner)
+        graph.add_node("rag_responder", self._rag_responder)
         graph.add_node("travel_react_agent", self._travel_react_agent)
-        graph.add_node("policy_validator_agent", self._policy_validator_agent)
-        graph.add_node("travel_retry_agent", self._travel_retry_agent)
-        graph.add_node("approval_agent", self._approval_agent)
-        graph.add_node("general_agent", self._general_agent)
-        graph.add_node("verification_agent", self._verification_agent)
-        graph.add_node("reflection_agent", self._reflection_agent)
-        graph.add_node("finalizer_agent", self._finalizer_agent)
+        graph.add_node("policy_validator", self._policy_validator)
+        graph.add_node("travel_retry_router", self._travel_retry_router)
+        graph.add_node("approval_processor", self._approval_processor)
+        graph.add_node("general_responder", self._general_responder)
+        graph.add_node("grounding_verifier", self._grounding_verifier)
+        graph.add_node("rag_self_corrector", self._rag_self_corrector)
+        graph.add_node("response_reviewer", self._response_reviewer)
+        graph.add_node("response_finalizer", self._response_finalizer)
 
-        graph.add_edge(START, "context_agent")
-        graph.add_edge("context_agent", "memory_fusion_agent")
-        graph.add_edge("memory_fusion_agent", "guardrail_agent")
-        graph.add_edge("verification_agent", "finalizer_agent")
-        graph.add_edge("reflection_agent", "finalizer_agent")
-        graph.add_edge("finalizer_agent", END)
+        graph.add_edge(START, "context_builder")
+        graph.add_edge("context_builder", "memory_fusion")
+        graph.add_edge("memory_fusion", "input_guardrail")
+        graph.add_edge("response_finalizer", END)
         return graph.compile()
 
-    async def _context_agent(self, state: TravelGraphState) -> dict[str, Any]:
+    async def _context_builder(self, state: TravelGraphState) -> dict[str, Any]:
         incoming = state["messages"]
         session_id = state.get("session_id")
         effective_messages = await self._effective_messages(incoming, session_id)
@@ -103,7 +112,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             "effective_messages": effective_messages,
             "openai_messages": openai_messages,
             "tool_trace": [],
-            "trace": self._append_trace(state, "context_agent", "prepared"),
+            "trace": self._append_trace(state, "context_builder", "prepared"),
             "citations": [],
             "approval_form": None,
             "booking_draft": None,
@@ -117,12 +126,14 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             "risk_level": "low",
             "answer_mode": None,
             "verification": None,
+            "claim_evidence_map": [],
+            "rag_correction_count": 0,
             "memory_context": "",
             "long_term_memories": [],
             "current_facts": [],
         }
 
-    async def _memory_fusion_agent(self, state: TravelGraphState) -> dict[str, Any]:
+    async def _memory_fusion(self, state: TravelGraphState) -> dict[str, Any]:
         text = self._last_user_text(state.get("effective_messages") or state["messages"])
         memory_owner = state.get("user_id") or state.get("session_id")
         current_facts = self._extract_long_term_facts(text)
@@ -141,7 +152,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             "long_term_memories": stored_memories,
             "trace": self._append_trace(
                 state,
-                "memory_fusion_agent",
+                "memory_fusion",
                 "fused",
                 {
                     "current_facts": len(current_facts),
@@ -151,32 +162,32 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             ),
         }
 
-    async def _guardrail_agent(
+    async def _input_guardrail(
         self, state: TravelGraphState
-    ) -> Command[Literal["planner_agent", "finalizer_agent"]]:
+    ) -> Command[Literal["planner", "response_finalizer"]]:
         text = self._last_user_text(state.get("effective_messages") or state["messages"])
         blocked = self._input_guardrail_message(text)
         trace = self._append_trace(
             state,
-            "guardrail_agent",
+            "input_guardrail",
             "blocked" if blocked else "passed",
         )
         if blocked:
             return Command(
                 update={"answer": blocked, "trace": trace, "risk_level": "medium"},
-                goto="finalizer_agent",
+                goto="response_finalizer",
             )
-        return Command(update={"trace": trace}, goto="planner_agent")
+        return Command(update={"trace": trace}, goto="planner")
 
-    async def _planner_agent(
+    async def _planner(
         self, state: TravelGraphState
-    ) -> Command[Literal["intent_agent"]]:
+    ) -> Command[Literal["intent_router"]]:
         text = self._last_user_text(state.get("effective_messages") or state["messages"])
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
                 "content": (
-                    "你是企业商旅 Planner Agent。请把用户目标拆成结构化执行计划，只输出 JSON，"
+                    "你是企业商旅任务规划器。请把用户目标拆成结构化执行计划，只输出 JSON，"
                     "字段包括 goal, slots, required_tools, missing_slots, steps, needs_clarification, rationale。"
                     "required_tools 只能从 recommend_travel_options, search_flights, search_trains, search_hotels, "
                     "check_travel_policy, rag_policy_lookup 中选择。不要编造工具结果。"
@@ -202,7 +213,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 "usage": usage,
                 "trace": self._append_trace(
                     state,
-                    "planner_agent",
+                    "planner",
                     "planned",
                     {
                         "required_tools": plan.get("required_tools", []),
@@ -210,12 +221,12 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                     },
                 ),
             },
-            goto="intent_agent",
+            goto="intent_router",
         )
 
-    async def _intent_agent(
+    async def _intent_router(
         self, state: TravelGraphState
-    ) -> Command[Literal["policy_reasoner_agent", "rag_agent", "general_agent"]]:
+    ) -> Command[Literal["policy_reasoner", "rag_responder", "general_responder"]]:
         text = self._last_user_text(state.get("effective_messages") or state["messages"])
         result = await self._intent.recognize(text)
         intent = result.intent.value
@@ -223,7 +234,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             update={
                 "intent": intent,
                 "trace": self._append_trace(
-                    state, "intent_agent", "classified", {"intent": intent}
+                    state, "intent_router", "classified", {"intent": intent}
                 ),
             },
             goto=self._route_after_intent(intent, text),
@@ -231,7 +242,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
 
     def _route_after_intent(
         self, intent: str | None, text: str
-    ) -> Literal["policy_reasoner_agent", "rag_agent", "general_agent"]:
+    ) -> Literal["policy_reasoner", "rag_responder", "general_responder"]:
         travel_intents = {
             TravelIntent.SEARCH_FLIGHT.value,
             TravelIntent.SEARCH_HOTEL.value,
@@ -242,20 +253,20 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             TravelIntent.BOOKING.value,
         }
         if self._is_inventory_or_planning_request(text):
-            return "policy_reasoner_agent"
+            return "policy_reasoner"
         if self._should_use_rag(intent, text):
-            return "rag_agent"
-        return "policy_reasoner_agent" if intent in travel_intents else "general_agent"
+            return "rag_responder"
+        return "policy_reasoner" if intent in travel_intents else "general_responder"
 
     def _route_after_answer(
         self, state: TravelGraphState
-    ) -> Literal["reflection_agent", "verification_agent"]:
+    ) -> Literal["response_reviewer", "grounding_verifier"]:
         text = self._last_user_text(state.get("effective_messages") or state["messages"])
         if any(k in text for k in ("反思", "检查一遍", "复核", "挑错")):
-            return "reflection_agent"
-        return "verification_agent"
+            return "response_reviewer"
+        return "grounding_verifier"
 
-    async def _policy_reasoner_agent(
+    async def _policy_reasoner(
         self, state: TravelGraphState
     ) -> Command[Literal["travel_react_agent"]]:
         text = self._last_user_text(state.get("effective_messages") or state["messages"])
@@ -266,21 +277,11 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             "confidence": 0.0,
             "notes": ["未检索到可用制度约束，后续合规校验将要求人工复核。"],
         }
-        store = self._document_store
-        if store is not None and getattr(store, "connected", False):
+        if self._knowledge_retrieval_available():
             try:
                 query = f"{text}\n差旅制度 酒店标准 舱位 提前预订 审批 金额"
-                vector = await EmbeddingService().embed_text(query)
-                hits = store.search(vector, top_k=5)
-                citations = [
-                    {
-                        "title": h.get("title"),
-                        "doc_type": h.get("doc_type"),
-                        "content": str(h.get("content") or "")[:800],
-                        "score": h.get("score"),
-                    }
-                    for h in hits
-                ]
+                hits = await self._retrieve_knowledge(query)
+                citations = [self._citation_from_hit(hit) for hit in hits]
                 constraints = await self._extract_policy_constraints(text, citations, state.get("memory_context", ""))
             except Exception as exc:  # noqa: BLE001
                 constraints = {
@@ -300,24 +301,24 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 "policy_constraints": constraints,
                 "trace": self._append_trace(
                     state,
-                    "policy_reasoner_agent",
+                    "policy_reasoner",
                     "constraints_extracted",
                     {
                         "source": constraints.get("source"),
                         "confidence": constraints.get("confidence"),
                         "citation_count": len(citations),
+                        "retrieval": self._retrieval_trace(citations),
                     },
                 ),
             },
             goto="travel_react_agent",
         )
 
-    async def _rag_agent(
+    async def _rag_responder(
         self, state: TravelGraphState
-    ) -> Command[Literal["reflection_agent", "finalizer_agent"]]:
+    ) -> Command[Literal["response_reviewer", "grounding_verifier"]]:
         text = self._last_user_text(state.get("effective_messages") or state["messages"])
-        store = self._document_store
-        if store is None or not getattr(store, "connected", False):
+        if not self._knowledge_retrieval_available():
             answer, usage = await self._llm_fallback_answer(
                 text,
                 reason="知识库当前不可用，未能检索公司制度依据。",
@@ -329,13 +330,12 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 "usage": usage,
                 "risk_level": "medium",
                 "answer_mode": "llm_fallback",
-                "trace": self._append_trace(state, "rag_agent", "knowledge_base_unavailable"),
+                "trace": self._append_trace(state, "rag_responder", "knowledge_base_unavailable"),
             }
             return Command(update=update, goto=self._route_after_answer({**state, **update}))
 
         try:
-            vector = await EmbeddingService().embed_text(text)
-            hits = store.search(vector, top_k=5)
+            hits = await self._retrieve_knowledge(text)
         except Exception as exc:
             answer, usage = await self._llm_fallback_answer(
                 text,
@@ -349,20 +349,12 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 "risk_level": "medium",
                 "answer_mode": "llm_fallback",
                 "trace": self._append_trace(
-                    state, "rag_agent", "retrieval_failed", {"error": str(exc)}
+                    state, "rag_responder", "retrieval_failed", {"error": str(exc)}
                 ),
             }
             return Command(update=update, goto=self._route_after_answer({**state, **update}))
 
-        citations = [
-            {
-                "title": h.get("title"),
-                "doc_type": h.get("doc_type"),
-                "content": str(h.get("content") or "")[:800],
-                "score": h.get("score"),
-            }
-            for h in hits
-        ]
+        citations = [self._citation_from_hit(hit) for hit in hits]
         if not self._has_reliable_citations(text, citations):
             answer, usage = await self._llm_fallback_answer(
                 text,
@@ -376,7 +368,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 "risk_level": "medium",
                 "answer_mode": "llm_fallback",
                 "trace": self._append_trace(
-                    state, "rag_agent", "fallback_no_reliable_citation", {"hit_count": len(citations)}
+                    state, "rag_responder", "fallback_no_reliable_citation", {"hit_count": len(citations)}
                 ),
             }
             return Command(update=update, goto=self._route_after_answer({**state, **update}))
@@ -389,8 +381,11 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             {
                 "role": "system",
                 "content": (
-                    "你是企业差旅制度问答 Agent。只能基于给定参考资料回答；"
-                    "资料不足时明确说明，不要编造制度。回答末尾列出引用编号。"
+                    "你是企业差旅制度问答助手。只能使用给定的最终 Top-5 参考资料回答；"
+                    "禁止使用模型记忆补充金额、期限、职级、适用范围或审批条件。"
+                    "资料没有直接说明时必须回答‘检索资料未提供该信息’；"
+                    "不得编造引用编号，也不得把通用建议表述为公司制度。"
+                    "每个制度性结论后标注对应引用编号。"
                 ),
             },
             {
@@ -409,21 +404,27 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             "risk_level": "low" if citations else "medium",
             "answer_mode": "rag_grounded",
             "trace": self._append_trace(
-                state, "rag_agent", "retrieved", {"hit_count": len(citations)}
+                state,
+                "rag_responder",
+                "retrieved",
+                {
+                    "hit_count": len(citations),
+                    "retrieval": self._retrieval_trace(citations),
+                },
             ),
         }
         return Command(update=update, goto=self._route_after_answer({**state, **update}))
 
     async def _travel_react_agent(
         self, state: TravelGraphState
-    ) -> Command[Literal["policy_validator_agent"]]:
+    ) -> Command[Literal["policy_validator"]]:
         messages = list(state["openai_messages"])
         attempt = int(state.get("travel_retry_count") or 0) + 1
         if state.get("execution_plan"):
             messages.append(
                 {
                     "role": "system",
-                    "content": "执行计划（由 Planner Agent 生成）：\n"
+                    "content": "执行计划（由 planner 节点生成）：\n"
                     + json.dumps(state["execution_plan"], ensure_ascii=False),
                 }
             )
@@ -519,7 +520,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                     },
                 ),
             }
-            return Command(update=update, goto="policy_validator_agent")
+            return Command(update=update, goto="policy_validator")
 
         update = {
             "answer": "已达到最大推理轮次，请简化问题后重试。",
@@ -534,11 +535,11 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 {"attempt": attempt},
             ),
         }
-        return Command(update=update, goto="policy_validator_agent")
+        return Command(update=update, goto="policy_validator")
 
-    async def _policy_validator_agent(
+    async def _policy_validator(
         self, state: TravelGraphState
-    ) -> Command[Literal["travel_retry_agent"]]:
+    ) -> Command[Literal["travel_retry_router"]]:
         draft = self._build_booking_draft(state)
         validation = self._build_policy_validation(state, draft)
         validation["attempt"] = int(state.get("travel_attempt") or 1)
@@ -548,7 +549,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 "policy_validation": validation,
                 "trace": self._append_trace(
                     state,
-                    "policy_validator_agent",
+                    "policy_validator",
                     validation.get("status", "checked"),
                     {
                         "violations": len(validation.get("violations") or []),
@@ -556,12 +557,12 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                     },
                 ),
             },
-            goto="travel_retry_agent",
+            goto="travel_retry_router",
         )
 
-    async def _travel_retry_agent(
+    async def _travel_retry_router(
         self, state: TravelGraphState
-    ) -> Command[Literal["travel_react_agent", "approval_agent"]]:
+    ) -> Command[Literal["travel_react_agent", "approval_processor"]]:
         validation = state.get("policy_validation") or {}
         status = str(validation.get("status") or "needs_review")
         retry_count = int(state.get("travel_retry_count") or 0)
@@ -579,12 +580,12 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                     "travel_retry_exhausted": False,
                     "trace": self._append_trace(
                         state,
-                        "travel_retry_agent",
+                        "travel_retry_router",
                         "validation_passed",
                         {"attempt": state.get("travel_attempt", 1)},
                     ),
                 },
-                goto="approval_agent",
+                goto="approval_processor",
             )
 
         if retry_reasons and retry_count < max_retries:
@@ -603,7 +604,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                     "travel_retry_exhausted": False,
                     "trace": self._append_trace(
                         state,
-                        "travel_retry_agent",
+                        "travel_retry_router",
                         "retry_scheduled",
                         {
                             "retry": next_retry_count,
@@ -655,7 +656,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 },
                 "trace": self._append_trace(
                     state,
-                    "travel_retry_agent",
+                    "travel_retry_router",
                     "retry_exhausted" if exhausted else "manual_review_required",
                     {
                         "retry_count": retry_count,
@@ -665,12 +666,12 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                     },
                 ),
             },
-            goto="approval_agent",
+            goto="approval_processor",
         )
 
-    async def _approval_agent(
+    async def _approval_processor(
         self, state: TravelGraphState
-    ) -> Command[Literal["reflection_agent", "finalizer_agent"]]:
+    ) -> Command[Literal["response_reviewer", "grounding_verifier"]]:
         draft = state.get("booking_draft") or self._build_booking_draft(state)
         form = self._build_approval_form(state, draft)
         validation = state.get("policy_validation") or {}
@@ -700,53 +701,132 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             "risk_level": risk_level,
             "trace": self._append_trace(
                 state,
-                "approval_agent",
+                "approval_processor",
                 "approval_required" if form and form.get("required") else "not_required",
             ),
         }
         return Command(update=update, goto=self._route_after_answer({**state, **update}))
 
-    async def _verification_agent(self, state: TravelGraphState) -> dict[str, Any]:
+    async def _grounding_verifier(
+        self, state: TravelGraphState
+    ) -> Command[Literal["rag_self_corrector", "response_finalizer"]]:
         answer = state.get("answer", "")
         citations = state.get("citations") or []
         answer_mode = state.get("answer_mode")
         verification = self._verify_answer_grounding(answer, citations, answer_mode)
-        updated_answer = answer
-        risk_level = state.get("risk_level") or "low"
-        mode = answer_mode
-        if not verification["passed"]:
-            risk_level = "high"
-            mode = "llm_fallback"
-            unsupported = "；".join(verification["unsupported_terms"])
-            updated_answer = (
-                f"{answer}\n\n核验提示：以下关键信息未能从当前引用资料中确认：{unsupported}。"
-                "请以公司制度或人工审批为准。"
-            )
-        return {
-            "answer": updated_answer,
-            "risk_level": risk_level,
-            "answer_mode": mode,
+        update: dict[str, Any] = {
             "verification": verification,
+            "claim_evidence_map": verification.get("claim_evidence_map") or [],
             "trace": self._append_trace(
                 state,
-                "verification_agent",
+                "grounding_verifier",
                 "passed" if verification["passed"] else "flagged",
-                {"unsupported_count": len(verification["unsupported_terms"])},
+                {
+                    "unsupported_count": len(verification["unsupported_terms"]),
+                    "correction_count": int(state.get("rag_correction_count") or 0),
+                },
             ),
         }
+        if verification["passed"]:
+            return Command(update=update, goto="response_finalizer")
 
-    async def _general_agent(
+        correction_count = int(state.get("rag_correction_count") or 0)
+        if answer_mode == "rag_grounded" and correction_count < 1:
+            update["risk_level"] = "medium"
+            return Command(update=update, goto="rag_self_corrector")
+
+        failed_claims = [
+            item.get("claim")
+            for item in verification.get("claim_evidence_map") or []
+            if item.get("status") != "supported"
+        ]
+        detail = "；".join(str(item) for item in failed_claims[:3] if item)
+        update.update(
+            {
+                "answer": (
+                    "当前检索资料不足或存在冲突，无法可靠给出公司制度结论。"
+                    + (f" 未通过核验的内容包括：{detail}。" if detail else "")
+                    + "请补充有效制度文档或提交人工确认。"
+                ),
+                "risk_level": "high",
+                "answer_mode": "llm_fallback",
+            }
+        )
+        return Command(update=update, goto="response_finalizer")
+
+    async def _general_responder(
         self, state: TravelGraphState
-    ) -> Command[Literal["reflection_agent", "finalizer_agent"]]:
+    ) -> Command[Literal["response_reviewer", "grounding_verifier"]]:
         resp = await self._llm.chat_completion(state["openai_messages"], temperature=0.2)
         update = {
             "answer": resp.choices[0].message.content or "",
             "usage": self._usage_dict(resp),
-            "trace": self._append_trace(state, "general_agent", "answered"),
+            "trace": self._append_trace(state, "general_responder", "answered"),
         }
         return Command(update=update, goto=self._route_after_answer({**state, **update}))
 
-    async def _reflection_agent(self, state: TravelGraphState) -> dict[str, Any]:
+    async def _rag_self_corrector(
+        self, state: TravelGraphState
+    ) -> Command[Literal["grounding_verifier"]]:
+        citations = state.get("citations") or []
+        evidence = "\n\n".join(
+            f"[{index}] chunk_id={item.get('chunk_id') or 'unknown'}\n{item.get('content') or ''}"
+            for index, item in enumerate(citations, start=1)
+        )
+        claim_map_json = json.dumps(
+            state.get("claim_evidence_map") or [], ensure_ascii=False
+        )
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "你是 RAG 回答校正器。只能依据给定证据删除、收缩或改写未通过核验的陈述，"
+                    "不得引入新事实。保留可直接支持的结论及其引用；资料不足时明确说明。"
+                    "直接输出校正后的最终答复。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"原回答：\n{state.get('answer', '')}\n\n"
+                    f"核验结果：\n{claim_map_json}\n\n"
+                    f"证据：\n{evidence}"
+                ),
+            },
+        ]
+        correction_error: str | None = None
+        try:
+            resp = await self._llm.chat_completion(prompt, temperature=0.1)
+            corrected = resp.choices[0].message.content or "检索资料不足，无法给出可靠制度结论。"
+            usage = self._usage_dict(resp)
+            status = "corrected"
+        except Exception as exc:  # noqa: BLE001
+            corrected = "检索资料不足，无法给出可靠制度结论。请提交人工确认。"
+            usage = state.get("usage")
+            status = "correction_failed"
+            correction_error = str(exc)
+        correction_count = int(state.get("rag_correction_count") or 0) + 1
+        return Command(
+            update={
+                "answer": corrected,
+                "rag_correction_count": correction_count,
+                "usage": usage,
+                "trace": self._append_trace(
+                    state,
+                    "rag_self_corrector",
+                    status,
+                    {
+                        "correction_count": correction_count,
+                        **({"error": correction_error} if correction_error else {}),
+                    },
+                ),
+            },
+            goto="grounding_verifier",
+        )
+
+    async def _response_reviewer(
+        self, state: TravelGraphState
+    ) -> Command[Literal["grounding_verifier"]]:
         answer = state.get("answer", "")
         prompt = [
             {
@@ -760,14 +840,17 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         ]
         resp = await self._llm.chat_completion(prompt, temperature=0.0)
         revised = resp.choices[0].message.content or answer
-        return {
-            "answer": revised,
-            "reflection_notes": "reflection_agent_applied",
-            "usage": self._usage_dict(resp),
-            "trace": self._append_trace(state, "reflection_agent", "revised"),
-        }
+        return Command(
+            update={
+                "answer": revised,
+                "reflection_notes": "response_reviewer_applied",
+                "usage": self._usage_dict(resp),
+                "trace": self._append_trace(state, "response_reviewer", "revised"),
+            },
+            goto="grounding_verifier",
+        )
 
-    async def _finalizer_agent(self, state: TravelGraphState) -> dict[str, Any]:
+    async def _response_finalizer(self, state: TravelGraphState) -> dict[str, Any]:
         answer = self._enforce_enterprise_answer_contract(
             state.get("answer", ""),
             self._current_attempt_tool_trace(state),
@@ -804,13 +887,15 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                         "feedback": state.get("travel_retry_feedback"),
                     },
                     "reflection": state.get("reflection_notes"),
-                    "trace": self._append_trace(state, "finalizer_agent", "completed"),
+                    "trace": self._append_trace(state, "response_finalizer", "completed"),
                     "citations": state.get("citations") or [],
                     "approval_form": state.get("approval_form"),
                     "booking_draft": booking_draft,
                     "risk_level": state.get("risk_level"),
                     "answer_mode": state.get("answer_mode"),
                     "verification": state.get("verification"),
+                    "claim_evidence_map": state.get("claim_evidence_map") or [],
+                    "rag_correction_count": int(state.get("rag_correction_count") or 0),
                     "memory": {
                         "current_facts": state.get("current_facts") or [],
                         "long_term_count": len(state.get("long_term_memories") or []),
@@ -1055,7 +1140,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             {
                 "role": "system",
                 "content": (
-                    "你是企业差旅制度约束抽取 Agent。只能根据参考资料抽取 JSON，不要编造。"
+                    "你是企业差旅制度约束抽取器。只能根据参考资料抽取 JSON，不要编造。"
                     "输出字段：source, constraints, confidence, notes。constraints 可包含 "
                     "hotel_limit_cny, advance_booking_days, approval_threshold_cny, cabin_limit, train_seat。"
                     "没有依据的字段不要输出。"
@@ -1219,6 +1304,72 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             content = f"未检索到公司制度依据。以下为模型基于通用商旅实践的建议：\n\n{content}"
         return content, self._usage_dict(resp)
 
+    def _knowledge_retrieval_available(self) -> bool:
+        if self._rag_retriever is not None:
+            return bool(getattr(self._rag_retriever, "connected", False))
+        return bool(
+            self._document_store is not None
+            and getattr(self._document_store, "connected", False)
+        )
+
+    async def _retrieve_knowledge(self, query: str) -> list[dict[str, Any]]:
+        vector = await EmbeddingService().embed_text(query)
+        if self._rag_retriever is not None:
+            if not getattr(self._rag_retriever, "connected", False):
+                raise RuntimeError("hybrid retrieval dependencies unavailable")
+            return await self._rag_retriever.retrieve(
+                query,
+                vector,
+                keyword_top_k=settings.rag_keyword_top_k,
+                vector_top_k=settings.rag_vector_top_k,
+                rrf_k=settings.rag_rrf_k,
+                candidate_top_k=settings.rag_fused_top_k,
+                final_top_k=settings.rag_final_top_k,
+            )
+        if self._document_store is None or not getattr(self._document_store, "connected", False):
+            raise RuntimeError("knowledge retrieval unavailable")
+        return self._document_store.search(vector, top_k=settings.rag_final_top_k)
+
+    @staticmethod
+    def _citation_from_hit(hit: dict[str, Any]) -> dict[str, Any]:
+        score = hit.get("rerank_score")
+        if score is None:
+            score = hit.get("rrf_score", hit.get("score"))
+        return {
+            "chunk_id": str(hit.get("chunk_id") or hit.get("id") or "") or None,
+            "title": hit.get("title"),
+            "doc_type": hit.get("doc_type"),
+            "content": str(hit.get("content") or hit.get("text") or "")[:2000],
+            "score": score,
+            "vector_score": hit.get("vector_score"),
+            "keyword_score": hit.get("keyword_score"),
+            "rrf_score": hit.get("rrf_score"),
+            "rerank_score": hit.get("rerank_score"),
+            "vector_rank": hit.get("vector_rank"),
+            "keyword_rank": hit.get("keyword_rank"),
+            "metadata": dict(hit.get("metadata") or {}),
+        }
+
+    @staticmethod
+    def _retrieval_trace(citations: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "keyword_top_k": settings.rag_keyword_top_k,
+            "vector_top_k": settings.rag_vector_top_k,
+            "rrf_k": settings.rag_rrf_k,
+            "candidate_top_k": settings.rag_fused_top_k,
+            "final_top_k": settings.rag_final_top_k,
+            "results": [
+                {
+                    "chunk_id": item.get("chunk_id"),
+                    "vector_rank": item.get("vector_rank"),
+                    "keyword_rank": item.get("keyword_rank"),
+                    "rrf_score": item.get("rrf_score"),
+                    "rerank_score": item.get("rerank_score"),
+                }
+                for item in citations
+            ],
+        }
+
     @staticmethod
     def _has_reliable_citations(text: str, citations: list[dict[str, Any]]) -> bool:
         if not citations:
@@ -1267,17 +1418,169 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 "reason": "non_rag_answer",
                 "checked_terms": [],
                 "unsupported_terms": [],
+                "claim_evidence_map": [],
             }
         citation_text = "\n".join(
             f"{item.get('title') or ''}\n{item.get('content') or ''}" for item in citations
         )
         checked_terms = LangGraphTravelOrchestrator._extract_verifiable_terms(answer)
         unsupported = [term for term in checked_terms if term not in citation_text]
+        claims = LangGraphTravelOrchestrator._split_atomic_claims(answer)
+        claim_evidence_map = [
+            LangGraphTravelOrchestrator._align_claim_to_evidence(claim, citations)
+            for claim in claims
+        ]
+        failed_claims = [
+            item for item in claim_evidence_map if item.get("status") != "supported"
+        ]
+        passed = not unsupported and not failed_claims
         return {
-            "passed": not unsupported,
-            "reason": "all_terms_supported" if not unsupported else "unsupported_terms_found",
+            "passed": passed,
+            "reason": "all_claims_supported" if passed else "claim_evidence_mismatch",
             "checked_terms": checked_terms,
             "unsupported_terms": unsupported,
+            "claim_evidence_map": claim_evidence_map,
+        }
+
+    @staticmethod
+    def _split_atomic_claims(answer: str) -> list[str]:
+        claims: list[str] = []
+        for piece in re.split(r"(?<=[。！？!?；;])|\n+", answer):
+            claim = re.sub(r"^\s*(?:[-*•]|\d+[.)、])\s*", "", piece).strip()
+            if not claim or claim.startswith(("引用", "参考资料", "来源")):
+                continue
+            if len(re.sub(r"\W", "", claim)) < 4:
+                continue
+            critical = LangGraphTravelOrchestrator._extract_verifiable_terms(claim)
+            is_policy_claim = any(
+                word in claim
+                for word in (
+                    "制度",
+                    "标准",
+                    "审批",
+                    "报销",
+                    "必须",
+                    "不得",
+                    "需要",
+                    "可以",
+                    "允许",
+                    "禁止",
+                    "规定",
+                    "应当",
+                    "公司",
+                    "员工",
+                    "酒店",
+                    "舱位",
+                    "高铁",
+                    "提前",
+                    "上限",
+                )
+            )
+            if critical or is_policy_claim:
+                claims.append(claim)
+        return claims
+
+    @staticmethod
+    def _align_claim_to_evidence(
+        claim: str, citations: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        critical_terms = LangGraphTravelOrchestrator._extract_verifiable_terms(claim)
+        claim_tokens = set(tokenize_for_keyword_search(claim))
+        claim_numbers = set(re.findall(r"\d+(?:\.\d+)?", claim))
+        claim_negative = any(
+            word in claim for word in ("不得", "禁止", "不能", "不允许", "无需", "不需要")
+        )
+        best: dict[str, Any] | None = None
+        best_overlap = 0.0
+        conflict: dict[str, Any] | None = None
+
+        for index, citation in enumerate(citations, start=1):
+            content = str(citation.get("content") or "")
+            if not content:
+                continue
+            evidence_tokens = set(tokenize_for_keyword_search(content))
+            overlap = len(claim_tokens & evidence_tokens) / max(len(claim_tokens), 1)
+            matched_terms = [term for term in critical_terms if term in content]
+            evidence_numbers = set(re.findall(r"\d+(?:\.\d+)?", content))
+            evidence_negative = any(
+                word in content
+                for word in ("不得", "禁止", "不能", "不允许", "无需", "不需要")
+            )
+            chunk_id = str(citation.get("chunk_id") or f"citation-{index}")
+            candidate = {
+                "chunk_id": chunk_id,
+                "content": content,
+                "overlap": overlap,
+                "matched_terms": matched_terms,
+            }
+            if overlap > best_overlap:
+                best = candidate
+                best_overlap = overlap
+            context_overlap = any(
+                word in claim and word in content
+                for word in ("酒店", "舱位", "审批", "报销", "预订", "高铁", "员工", "标准")
+            )
+            if (
+                claim_numbers
+                and evidence_numbers
+                and claim_numbers.isdisjoint(evidence_numbers)
+                and context_overlap
+            ):
+                if conflict is None or overlap > float(conflict["overlap"]):
+                    conflict = candidate
+            polarity_conflict = (
+                claim_negative != evidence_negative and context_overlap and overlap >= 0.25
+            )
+            if polarity_conflict:
+                if conflict is None or overlap > float(conflict["overlap"]):
+                    conflict = candidate
+            if (
+                not polarity_conflict
+                and critical_terms
+                and len(matched_terms) == len(critical_terms)
+                and overlap >= 0.18
+            ):
+                return {
+                    "claim": claim,
+                    "status": "supported",
+                    "supporting_chunk_ids": [chunk_id],
+                    "evidence_spans": [content[:320]],
+                    "reason": "关键实体、数值及条件可由同一证据片段直接支持",
+                }
+            if not polarity_conflict and not critical_terms and overlap >= 0.55:
+                return {
+                    "claim": claim,
+                    "status": "supported",
+                    "supporting_chunk_ids": [chunk_id],
+                    "evidence_spans": [content[:320]],
+                    "reason": "陈述与证据片段语义要素一致",
+                }
+
+        if conflict is not None:
+            return {
+                "claim": claim,
+                "status": "conflict",
+                "supporting_chunk_ids": [conflict["chunk_id"]],
+                "evidence_spans": [str(conflict["content"])[:320]],
+                "reason": "证据涉及相同制度主题，但关键数值或条件与回答冲突",
+            }
+        if best is not None and (
+            best_overlap >= 0.3
+            or (critical_terms and 0 < len(best["matched_terms"]) < len(critical_terms))
+        ):
+            return {
+                "claim": claim,
+                "status": "partial",
+                "supporting_chunk_ids": [best["chunk_id"]],
+                "evidence_spans": [str(best["content"])[:320]],
+                "reason": "证据仅覆盖部分实体、数值或适用条件",
+            }
+        return {
+            "claim": claim,
+            "status": "unsupported",
+            "supporting_chunk_ids": [],
+            "evidence_spans": [],
+            "reason": "最终检索结果中没有能够直接支持该陈述的证据",
         }
 
     @staticmethod

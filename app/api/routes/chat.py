@@ -636,4 +636,6 @@ async def chat(
         risk_level=metadata.get("risk_level"),
         answer_mode=metadata.get("answer_mode"),
         verification=metadata.get("verification"),
+        claim_evidence_map=metadata.get("claim_evidence_map") or [],
+        rag_correction_count=int(metadata.get("rag_correction_count") or 0),
     )

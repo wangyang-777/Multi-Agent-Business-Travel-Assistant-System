@@ -1,10 +1,10 @@
 # 商旅-agent-guide（Python）
 
-企业级差旅 AI Agent 服务：基于 FastAPI 提供对话、行程规划、差标校验与知识库向量检索，适用于与 OA/费控/供应商系统集成的差旅场景。
+企业级智能差旅服务：基于 FastAPI 提供对话、行程规划、差标校验与知识库向量检索，适用于与 OA/费控/供应商系统集成的差旅场景。
 
 ## 功能概览
 
-- **对话与工具调用**：LangGraph 多 Agent 编排 + ReAct 风格工具调用，内置「行程草稿」「差标校验」工具。
+- **对话与工具调用**：LangGraph 工作流编排 + 单个旅行 ReAct Agent，内置「行程草稿」「差标校验」工具。
 - **健康检查**：探测 Redis、PostgreSQL、Milvus 可用性，返回 `ok` / `degraded`。
 - **文档入库与检索**：文本嵌入（OpenAI Embeddings）写入 Milvus，支持相似度检索。
 
@@ -24,7 +24,7 @@
 ```
 
 - **应用层**：`app/main.py` 注册路由与生命周期（连接池、向量库）。
-- **编排层**：`app/agent/langgraph_orchestrator.py` 使用 LangGraph 将上下文、意图识别、差旅工具调用、通用回答、复核与最终持久化拆成多个 Agent 节点；`app/agent/orchestrator.py` 保留为 legacy fallback。
+- **编排层**：`app/agent/langgraph_orchestrator.py` 使用 LangGraph 组织一个旅行 ReAct Agent，以及上下文、规划、路由、RAG、规则校验和响应处理节点；`app/agent/orchestrator.py` 保留为 legacy fallback。
 - **领域层**：`app/domain/travel/` 行程构建、差标规则与校验。
 - **基础设施**：`app/services/`（LLM、嵌入、Milvus）、`app/infrastructure/`（可选扩展）。
 
@@ -87,7 +87,7 @@ docker compose up -d postgres redis etcd minio milvus-standalone
 ```
 
 - `stream: false`：返回 JSON，结构与 OpenAI Chat Completions 类似（`choices[0].message.content`）。
-- 响应同时包含结构化增强字段：`tables`（表格化行程/差标）、`citations`（RAG 引用）、`approval_form`（人工审批单）、`trace`（Agent 执行轨迹）、`risk_level`（风险等级）。
+- 响应同时包含结构化增强字段：`tables`（表格化行程/差标）、`citations`（RAG 引用）、`approval_form`（人工审批单）、`trace`（工作流节点执行轨迹）、`risk_level`（风险等级）。
 - `stream: true`：`text/event-stream`，每行 `data: {JSON}`，含 `StreamChunk`（`content` / `done` / `error`）。
 
 ### POST `/api/v1/mcp/rpc`
@@ -111,7 +111,7 @@ docker compose up -d postgres redis etcd minio milvus-standalone
 
 ## 配置项
 
-见 `.env.example`。主要变量：`OPENAI_*`、`EMBEDDING_*`、`DATABASE_URL`、`REDIS_URL`、`MILVUS_*`、`LOG_LEVEL`。Agent 相关阈值（窗口、摘要、熔断）在 `app/config.py` 中定义。
+见 `.env.example`。主要变量：`OPENAI_*`、`EMBEDDING_*`、`DATABASE_URL`、`REDIS_URL`、`MILVUS_*`、`LOG_LEVEL`。编排与模型相关阈值（窗口、摘要、熔断）在 `app/config.py` 中定义。
 
 聊天模型和向量模型可分开配置。例如使用 DeepSeek 聊天、OpenAI embeddings：
 
@@ -126,46 +126,45 @@ EMBEDDING_API_KEY=your_openai_key
 EMBEDDING_DIMENSIONS=1536
 ```
 
-### Agent 编排模式
+### LangGraph 工作流模式
 
 默认使用 LangGraph：
 
 ```text
-context_agent
+context_builder
   ↓
-guardrail_agent
+memory_fusion
   ↓
-intent_agent
-  ├─ policy_reasoner_agent
+input_guardrail
+  ↓
+planner
+  ↓
+intent_router
+  ├─ policy_reasoner
   │    ↓
   │  travel_react_agent
   │    ↓
-  │  policy_validator_agent
+  │  policy_validator
   │    ↓
-  │  travel_retry_agent ── 可修复且未重试 ──> travel_react_agent
+  │  travel_retry_router ── 可修复且未重试 ──> travel_react_agent
   │    ↓ 通过 / 重试耗尽
-  │  approval_agent
+  │  approval_processor
   │    ↓
-  │  reflection_agent（仅在用户要求复核/挑错时）
+  │  response_reviewer（仅在用户要求复核/挑错时）
   │    ↓
-  ├─ rag_agent
+  ├─ rag_responder
   │    ↓
-  └─ general_agent
+  └─ general_responder
        ↓
-finalizer_agent
+response_finalizer
 ```
 
-- `context_agent`：加载 Redis 会话、合并历史、摘要长对话、裁剪上下文。
-- `guardrail_agent`：执行输入安全与流程边界检查，例如信息不足时阻断预订、拦截明显违规请求。
-- `intent_agent`：识别差旅行程、差标、预订、通用问题等意图，并路由到对应节点。
-- `travel_react_agent`：使用 OpenAI function calling 调用行程规划与差标校验工具。
-- `policy_validator_agent`：基于制度约束校验当前轮候选和预订草稿。
-- `travel_retry_agent`：在校验后判断是否携带违规原因重查候选，默认最多重试一次；仍失败时提升风险并要求人工审核。
-- `rag_agent`：对制度、政策、报销、审批等知识类问题检索 Milvus 知识库，并返回引用来源。
-- `approval_agent`：根据金额、差标 warning 和工具结果生成 `approval_form`，需要人工审批时标记 `pending_human_approval`。
-- `general_agent`：处理不需要差旅工具的普通对话。
-- `reflection_agent`：当用户要求“复核/检查/挑错/反思”时，对答案进行质检和修订。
-- `finalizer_agent`：保存会话并返回兼容 `/api/v1/chat` 的响应结构。
+本项目将“Agent”限定为能够自主选择工具、读取工具 observation 并在循环中决定下一步的组件。因此当前在线主链路只有 `travel_react_agent` 属于 Agent；LangGraph 中其他可执行单元统一称为节点。
+
+- **Agent**：`travel_react_agent` 使用 OpenAI function calling 自主选择旅行工具，并在最多 N 轮 ReAct 循环中根据工具结果继续行动或结束。
+- **LLM 节点**：`planner`、`policy_reasoner`、`rag_responder`、`general_responder`、`response_reviewer` 各执行一次有边界的模型任务，不自行调度其他节点。
+- **规则节点**：`input_guardrail`、`intent_router`、`policy_validator`、`travel_retry_router`、`approval_processor`、`grounding_verifier` 执行确定性检查、路由或结构化数据处理。
+- **上下文与基础设施节点**：`context_builder`、`memory_fusion`、`response_finalizer` 负责会话装配、记忆融合、持久化和响应组装。
 
 可通过环境变量切回旧编排器：
 
