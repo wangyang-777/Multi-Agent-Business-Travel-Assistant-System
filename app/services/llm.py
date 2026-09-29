@@ -32,6 +32,7 @@ class LLMService:
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = "auto",
         temperature: float = 0.2,
+        response_format: dict[str, Any] | None = None,
     ) -> Any:
         async def _call() -> Any:
             kwargs: dict[str, Any] = {
@@ -42,6 +43,8 @@ class LLMService:
             if tools:
                 kwargs["tools"] = tools
                 kwargs["tool_choice"] = tool_choice
+            if response_format is not None:
+                kwargs["response_format"] = response_format
             return await self._client.chat.completions.create(**kwargs)
 
         return await self._breaker.call(_call)

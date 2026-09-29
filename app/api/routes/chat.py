@@ -191,6 +191,40 @@ def _table_from_booking_draft(draft: dict[str, Any]) -> list[ResponseTable]:
 def _table_from_execution_plan(plan: dict[str, Any]) -> list[ResponseTable]:
     if not plan:
         return []
+    if isinstance(plan.get("tasks"), list):
+        tasks = [item for item in plan["tasks"] if isinstance(item, dict)]
+        tables = [
+            ResponseTable(
+                title="执行计划",
+                columns=["项目", "内容"],
+                rows=[
+                    {"项目": "主要意图", "内容": _string(plan.get("primary_intent"))},
+                    {"项目": "任务数量", "内容": str(len(tasks))},
+                    {
+                        "项目": "待澄清信息",
+                        "内容": _string(plan.get("clarification_question")) or "无",
+                    },
+                ],
+            )
+        ]
+        if tasks:
+            tables.append(
+                ResponseTable(
+                    title="任务列表",
+                    columns=["任务 ID", "意图", "任务说明", "前置任务", "缺失参数"],
+                    rows=[
+                        {
+                            "任务 ID": _string(item.get("id")),
+                            "意图": _string(item.get("intent")),
+                            "任务说明": _string(item.get("request")),
+                            "前置任务": "、".join(item.get("depends_on") or []) or "无",
+                            "缺失参数": "、".join(item.get("missing_slots") or []) or "无",
+                        }
+                        for item in tasks
+                    ],
+                )
+            )
+        return tables
     summary_rows = [
         {"项目": "目标", "内容": _string(plan.get("goal"))},
         {"项目": "Planner", "内容": _string(plan.get("planner"))},
@@ -504,6 +538,59 @@ def _table_from_inventory_json(text: str) -> list[ResponseTable]:
     return tables
 
 
+def _table_from_approval_form(form: dict[str, Any]) -> list[ResponseTable]:
+    if not form:
+        return []
+    fields = {
+        "status": "审批状态",
+        "employee_id": "员工 ID",
+        "grade": "职级",
+        "origin_city": "出发城市",
+        "destination_city": "目的城市",
+        "departure_date": "出发日期",
+        "return_date": "返回日期",
+        "estimated_total_cny": "预估金额",
+        "reason": "审批原因",
+    }
+    rows = [{"项目": "是否需要审批", "内容": "是" if form.get("required") else "否"}]
+    rows.extend(
+        {"项目": label, "内容": _string(form.get(field))}
+        for field, label in fields.items()
+        if form.get(field) is not None
+    )
+    warnings = form.get("policy_warnings") or []
+    if warnings:
+        rows.append({"项目": "差标提示", "内容": "；".join(str(item) for item in warnings)})
+    return [ResponseTable(title="审批表单", columns=["项目", "内容"], rows=rows)]
+
+
+def _label_task_tables(tables: list[ResponseTable], task_id: str) -> list[ResponseTable]:
+    if not task_id:
+        return tables
+    return [
+        table.model_copy(update={"title": f"{task_id} · {table.title}"}) for table in tables
+    ]
+
+
+def _tables_from_tool_trace(tool_trace: list[dict[str, Any]]) -> list[ResponseTable]:
+    latest_attempt: dict[str, int] = {}
+    for item in tool_trace:
+        task_id = _string(item.get("task_id"))
+        attempt = item.get("attempt")
+        if isinstance(attempt, int):
+            latest_attempt[task_id] = max(latest_attempt.get(task_id, attempt), attempt)
+    tables: list[ResponseTable] = []
+    for item in tool_trace:
+        task_id = _string(item.get("task_id"))
+        if task_id in latest_attempt and item.get("attempt") != latest_attempt[task_id]:
+            continue
+        output = item.get("output")
+        if isinstance(output, str):
+            item_tables = _table_from_inventory_json(output) + _table_from_itinerary_text(output)
+            tables.extend(_label_task_tables(item_tables, task_id))
+    return tables
+
+
 def _build_response_tables(raw: dict[str, Any]) -> list[ResponseTable]:
     tables: list[ResponseTable] = []
     metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
@@ -522,22 +609,55 @@ def _build_response_tables(raw: dict[str, Any]) -> list[ResponseTable]:
     if isinstance(booking_draft, dict):
         tables.extend(_table_from_booking_draft(booking_draft))
 
-    if isinstance(tool_trace, list):
-        attempt_values = [
-            int(item["attempt"])
-            for item in tool_trace
-            if isinstance(item, dict) and isinstance(item.get("attempt"), int)
-        ]
-        display_attempt = max(attempt_values) if attempt_values else None
-        for item in tool_trace:
-            if not isinstance(item, dict):
-                continue
-            if display_attempt is not None and item.get("attempt") != display_attempt:
-                continue
-            output = item.get("output")
-            if isinstance(output, str):
-                tables.extend(_table_from_inventory_json(output))
-                tables.extend(_table_from_itinerary_text(output))
+    task_results = [
+        item for item in metadata.get("task_results") or [] if isinstance(item, dict)
+    ]
+    is_multi_task = metadata.get("route") == "multi_task" or len(task_results) > 1
+    if is_multi_task and task_results:
+        status_labels = {
+            "completed": "已完成",
+            "needs_review": "待复核",
+            "failed": "执行失败",
+            "blocked": "等待前置条件",
+        }
+        tables.append(
+            ResponseTable(
+                title="任务执行结果",
+                columns=["任务 ID", "意图", "任务说明", "状态"],
+                rows=[
+                    {
+                        "任务 ID": _string(item.get("task_id")),
+                        "意图": _string(item.get("intent")),
+                        "任务说明": _string(item.get("request")),
+                        "状态": status_labels.get(item.get("status"), _string(item.get("status"))),
+                    }
+                    for item in task_results
+                ],
+            )
+        )
+        for task in task_results:
+            task_id = _string(task.get("task_id"))
+            for field, builder in (
+                ("policy_constraints", _table_from_policy_constraints),
+                ("policy_validation", _table_from_policy_validation),
+                ("booking_draft", _table_from_booking_draft),
+                ("approval_form", _table_from_approval_form),
+            ):
+                payload = task.get(field)
+                if isinstance(payload, dict):
+                    tables.extend(_label_task_tables(builder(payload), task_id))
+
+    trace_items = [item for item in tool_trace or [] if isinstance(item, dict)]
+    trace_task_ids = {_string(item.get("task_id")) for item in trace_items}
+    for task in task_results:
+        task_id = _string(task.get("task_id"))
+        if task_id not in trace_task_ids:
+            trace_items.extend(
+                {**item, "task_id": task_id}
+                for item in task.get("tool_trace") or []
+                if isinstance(item, dict)
+            )
+    tables.extend(_tables_from_tool_trace(trace_items))
 
     if tables:
         return tables
@@ -629,6 +749,9 @@ async def chat(
         approval_form=_build_approval_form(raw),
         booking_draft=_build_booking_draft(raw),
         execution_plan=metadata.get("execution_plan"),
+        route=metadata.get("route"),
+        intent=metadata.get("intent"),
+        task_results=metadata.get("task_results") or [],
         policy_constraints=metadata.get("policy_constraints"),
         policy_validation=metadata.get("policy_validation"),
         travel_retry=metadata.get("travel_retry"),

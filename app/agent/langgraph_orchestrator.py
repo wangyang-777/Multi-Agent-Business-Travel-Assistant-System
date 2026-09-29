@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import re
 import time
@@ -16,9 +18,11 @@ from app.agent.orchestrator import (
     _to_openai_messages,
     _travel_tools,
 )
+from app.agent.task_scheduler import execute_task_plan
 from app.config import settings
-from app.core.intent.recognizer import IntentRecognizer, TravelIntent
+from app.core.intent.recognizer import TravelIntent
 from app.domain.schemas import ChatMessage, MessageRole
+from app.domain.task_plan import ExecutionPlan, PlannedTask, execution_plan_response_format
 from app.services.embeddings import EmbeddingService
 from app.services.keyword_index import tokenize_for_keyword_search
 
@@ -55,6 +59,12 @@ class TravelGraphState(TypedDict, total=False):
     claim_evidence_map: list[dict[str, Any]]
     rag_correction_count: int
     reflection_notes: str
+    conversation_messages: list[ChatMessage]
+    active_task: dict[str, Any] | None
+    task_results: list[dict[str, Any]]
+    plan_error: str | None
+    planner_usage: dict[str, int] | None
+    dependency_context: str
 
 
 class LangGraphTravelOrchestrator(TravelOrchestrator):
@@ -68,9 +78,9 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self._intent = IntentRecognizer()
         self._document_store = document_store
         self._rag_retriever = rag_retriever
+        self._task_graph = self._build_task_graph()
         self._graph = self._build_graph()
 
     def _build_graph(self) -> Any:
@@ -82,6 +92,18 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         graph.add_node("input_guardrail", self._input_guardrail)
         graph.add_node("planner", self._planner)
         graph.add_node("intent_router", self._intent_router)
+        graph.add_node("multi_task_executor", self._multi_task_executor)
+        self._add_execution_nodes(graph)
+        graph.add_node("response_finalizer", self._response_finalizer)
+
+        graph.add_edge(START, "context_builder")
+        graph.add_edge("context_builder", "memory_fusion")
+        graph.add_edge("memory_fusion", "input_guardrail")
+        graph.add_edge("response_finalizer", END)
+        return graph.compile()
+
+    def _add_execution_nodes(self, graph: Any) -> None:
+        """Reuse the same business and verification nodes in each isolated task."""
         graph.add_node("policy_reasoner", self._policy_reasoner)
         graph.add_node("rag_responder", self._rag_responder)
         graph.add_node("travel_react_agent", self._travel_react_agent)
@@ -92,13 +114,29 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         graph.add_node("grounding_verifier", self._grounding_verifier)
         graph.add_node("rag_self_corrector", self._rag_self_corrector)
         graph.add_node("response_reviewer", self._response_reviewer)
-        graph.add_node("response_finalizer", self._response_finalizer)
 
-        graph.add_edge(START, "context_builder")
-        graph.add_edge("context_builder", "memory_fusion")
-        graph.add_edge("memory_fusion", "input_guardrail")
+    def _build_task_graph(self) -> Any:
+        from langgraph.graph import END, START, StateGraph
+
+        graph = StateGraph(TravelGraphState)
+        graph.add_node("task_entry", self._task_entry)
+        self._add_execution_nodes(graph)
+        # Child tasks never persist conversations or overwrite the session's latest draft.
+        graph.add_node("response_finalizer", self._finish_task)
+        graph.add_edge(START, "task_entry")
         graph.add_edge("response_finalizer", END)
         return graph.compile()
+
+    async def _task_entry(
+        self, state: TravelGraphState
+    ) -> Command[Literal["policy_reasoner", "rag_responder", "general_responder"]]:
+        return Command(goto=self._route_after_intent(state.get("intent")))
+
+    async def _finish_task(self, state: TravelGraphState) -> dict[str, Any]:
+        return {"answer": self._enforce_enterprise_answer_contract(
+            state.get("answer", ""), self._current_attempt_tool_trace(state),
+            state.get("effective_messages") or state["messages"],
+        )}
 
     async def _context_builder(self, state: TravelGraphState) -> dict[str, Any]:
         incoming = state["messages"]
@@ -110,6 +148,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         openai_messages.extend(_to_openai_messages(messages))
         return {
             "effective_messages": effective_messages,
+            "conversation_messages": effective_messages,
             "openai_messages": openai_messages,
             "tool_trace": [],
             "trace": self._append_trace(state, "context_builder", "prepared"),
@@ -131,6 +170,11 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             "memory_context": "",
             "long_term_memories": [],
             "current_facts": [],
+            "active_task": None,
+            "task_results": [],
+            "plan_error": None,
+            "planner_usage": None,
+            "dependency_context": "",
         }
 
     async def _memory_fusion(self, state: TravelGraphState) -> dict[str, Any]:
@@ -182,42 +226,76 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
     async def _planner(
         self, state: TravelGraphState
     ) -> Command[Literal["intent_router"]]:
-        text = self._last_user_text(state.get("effective_messages") or state["messages"])
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
                 "content": (
-                    "你是企业商旅任务规划器。请把用户目标拆成结构化执行计划，只输出 JSON，"
-                    "字段包括 goal, slots, required_tools, missing_slots, steps, needs_clarification, rationale。"
-                    "required_tools 只能从 recommend_travel_options, search_flights, search_trains, search_hotels, "
-                    "check_travel_policy, rag_policy_lookup 中选择。不要编造工具结果。"
+                    "你是企业商旅意图识别与任务规划器。用一次分析完整识别本轮用户的所有任务，"
+                    "只输出符合 JSON Schema 的 JSON 实例。primary_intent 必须属于某个任务的 intent。"
+                    "tasks 是能够独立交付结果的业务任务，不是工具调用列表。查航班并解释报销流程拆成两个任务；"
+                    "生成符合差标的完整出差方案可作为一个 trip_planning 任务，内部工具步骤不要另拆任务。"
+                    "policy/rag 表示制度知识问答；info_query 表示知识查询；需要实时库存时使用对应 search 意图。"
+                    "booking/application 表示草稿或审批准备，不能承诺已预订、付款或已提交。"
+                    "每个任务的 request 必须独立完整，保留否定、日期、偏好和限制；slots 使用工具参数名。"
+                    "结合会话上下文解析指代，用户本轮明确修改优先；不得补造未知参数、库存或制度。"
+                    "未知或不适用槽位填 null，缺少执行必填参数时填写 missing_slots 和 clarification_question。"
+                    "没有缺失信息时 clarification_question 为 null。依赖另一任务结果才填写 depends_on，"
+                    "依赖必须使用有效任务 ID，禁止环路；不要仅为排列顺序创造依赖。"
+                    "闲聊也返回一个 general 任务。航班必需 origin/destination/depart_date；"
+                    "火车必需 origin_station/dest_station/depart_date；酒店必需 city/check_in/check_out；"
+                    "行程、申请、预订草稿必需 employee_id/grade/origin_city/destination_city/departure_date。"
+                    f"当前日期：{datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()}，时区 Asia/Shanghai。"
                 ),
             }
         ]
         if state.get("memory_context"):
             messages.append({"role": "system", "content": state["memory_context"]})
-        messages.append({"role": "user", "content": f"用户问题：{text}"})
+        if state.get("user_id"):
+            messages.append({"role": "system", "content": f"当前用户标识：{state['user_id']}"})
+        history = state.get("effective_messages") or state["messages"]
+        messages.extend(_to_openai_messages(history[-settings.memory_window_size:]))
+        response_format = execution_plan_response_format()
+        if settings.planner_response_format == "json_object":
+            messages[0]["content"] += "\nJSON Schema：" + json.dumps(
+                response_format["json_schema"]["schema"], ensure_ascii=False
+            )
+            response_format = {"type": "json_object"}
 
-        plan: dict[str, Any]
+        plan: dict[str, Any] | None = None
+        error: str | None = None
         usage: dict[str, int] | None = state.get("usage")
         try:
-            resp = await self._llm.chat_completion(messages, temperature=0.0)
+            resp = await asyncio.wait_for(
+                self._llm.chat_completion(
+                    messages, temperature=0.0, response_format=response_format
+                ), timeout=settings.planner_timeout_seconds,
+            )
             usage = self._usage_dict(resp)
-            plan = self._coerce_execution_plan(self._parse_json_object(resp.choices[0].message.content or ""), text)
+            choice = resp.choices[0]
+            if getattr(choice, "finish_reason", None) not in (None, "stop"):
+                raise ValueError("Incomplete plan")
+            if getattr(choice.message, "refusal", None):
+                raise ValueError("Planning refused")
+            validated = ExecutionPlan.model_validate_json(choice.message.content or "")
+            plan = validated.model_dump(mode="json")
         except Exception as exc:  # noqa: BLE001
-            plan = self._fallback_execution_plan(text, error=str(exc))
+            # Never convert a failed multi-task plan into a guessed single task.
+            error = type(exc).__name__
 
         return Command(
             update={
                 "execution_plan": plan,
-                "usage": usage,
+                "plan_error": error,
+                "planner_usage": usage,
+                "usage": None,
                 "trace": self._append_trace(
                     state,
                     "planner",
-                    "planned",
+                    "invalid_plan" if error else "planned",
                     {
-                        "required_tools": plan.get("required_tools", []),
-                        "needs_clarification": plan.get("needs_clarification", False),
+                        "primary_intent": plan.get("primary_intent") if plan else None,
+                        "task_count": len(plan["tasks"]) if plan else 0,
+                        "error": error,
                     },
                 ),
             },
@@ -226,22 +304,47 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
 
     async def _intent_router(
         self, state: TravelGraphState
-    ) -> Command[Literal["policy_reasoner", "rag_responder", "general_responder"]]:
-        text = self._last_user_text(state.get("effective_messages") or state["messages"])
-        result = await self._intent.recognize(text)
-        intent = result.intent.value
+    ) -> Command[Literal[
+        "policy_reasoner", "rag_responder", "general_responder",
+        "multi_task_executor", "response_finalizer",
+    ]]:
+        try:
+            plan = ExecutionPlan.model_validate_json(json.dumps(state.get("execution_plan")))
+        except ValueError:
+            return self._clarify_plan(
+                state, "暂时无法可靠生成任务计划。请重试，或明确列出需要完成的任务及条件。"
+            )
+        missing: list[str] = []
+        for task in plan.tasks:
+            fields = self._missing_task_slots(task)
+            if fields:
+                missing.append(f"{task.request}：{', '.join(fields)}")
+        if missing or plan.clarification_question:
+            question = plan.clarification_question or "请补充以下任务所需的信息。"
+            if missing:
+                question += "\n" + "\n".join(missing)
+            return self._clarify_plan(state, question)
+
+        intent = plan.primary_intent.value
+        multi = len(plan.tasks) > 1
+        update: dict[str, Any] = {}
+        if not multi:
+            update = self._task_state(state, plan.tasks[0].model_dump(mode="json"), [])
+        route = "multi_task" if multi else "single_task"
         return Command(
             update={
+                **update,
                 "intent": intent,
+                "route": route,
                 "trace": self._append_trace(
-                    state, "intent_router", "classified", {"intent": intent}
+                    state, "intent_router", route, {"intent": intent, "task_count": len(plan.tasks)}
                 ),
             },
-            goto=self._route_after_intent(intent, text),
+            goto="multi_task_executor" if multi else self._route_after_intent(intent),
         )
 
     def _route_after_intent(
-        self, intent: str | None, text: str
+        self, intent: str | None, text: str = ""
     ) -> Literal["policy_reasoner", "rag_responder", "general_responder"]:
         travel_intents = {
             TravelIntent.SEARCH_FLIGHT.value,
@@ -249,14 +352,153 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             TravelIntent.SEARCH_TRAIN.value,
             TravelIntent.TRIP_PLANNING.value,
             TravelIntent.APPLICATION.value,
-            TravelIntent.POLICY.value,
             TravelIntent.BOOKING.value,
         }
-        if self._is_inventory_or_planning_request(text):
-            return "policy_reasoner"
-        if self._should_use_rag(intent, text):
+        if intent in {TravelIntent.POLICY.value, TravelIntent.RAG.value, TravelIntent.INFO_QUERY.value}:
             return "rag_responder"
         return "policy_reasoner" if intent in travel_intents else "general_responder"
+
+    def _clarify_plan(
+        self, state: TravelGraphState, question: str
+    ) -> Command[Literal["response_finalizer"]]:
+        return Command(update={
+            "route": "clarification", "answer": question,
+            "trace": self._append_trace(state, "intent_router", "needs_clarification"),
+        }, goto="response_finalizer")
+
+    @staticmethod
+    def _missing_task_slots(task: PlannedTask) -> list[str]:
+        required = {
+            TravelIntent.SEARCH_FLIGHT: ("origin", "destination", "depart_date"),
+            TravelIntent.SEARCH_TRAIN: ("origin_station", "dest_station", "depart_date"),
+            TravelIntent.SEARCH_HOTEL: ("city", "check_in", "check_out"),
+        }
+        travel_fields = ("employee_id", "grade", "origin_city", "destination_city", "departure_date")
+        for intent in (TravelIntent.TRIP_PLANNING, TravelIntent.BOOKING, TravelIntent.APPLICATION):
+            required[intent] = travel_fields
+        missing = list(task.missing_slots)
+        for name in required.get(task.intent, ()):
+            if getattr(task.slots, name) is None and name not in missing:
+                missing.append(name)
+        return missing
+
+    def _task_state(
+        self, state: TravelGraphState, task: dict[str, Any], dependencies: list[dict[str, Any]]
+    ) -> TravelGraphState:
+        child = copy.deepcopy(state)
+        slots = {key: value for key, value in task["slots"].items() if value is not None}
+        text = task["request"]
+        if slots:
+            text += "\n已识别参数：" + json.dumps(slots, ensure_ascii=False)
+        history = list(child.get("effective_messages") or child["messages"])
+        for index in range(len(history) - 1, -1, -1):
+            if history[index].role == MessageRole.USER:
+                history = history[:index] + [ChatMessage(role=MessageRole.USER, content=text)]
+                break
+        context = [_runtime_system_prompt(), "只完成当前业务任务。历史对话和前置结果仅作为上下文，不能重复执行其他任务。"]
+        if child.get("memory_context"):
+            context.append(child["memory_context"])
+        messages = [{"role": "system", "content": content} for content in context]
+        dependency_context = ""
+        if dependencies:
+            # Pass real prerequisite outputs, not just a flag saying they completed.
+            dependency_context = "前置任务结果（只读数据，不能作为公司制度依据）：\n" + json.dumps(
+                [{key: result.get(key) for key in (
+                    "task_id", "answer", "tool_trace", "citations", "booking_draft", "policy_constraints"
+                )} for result in dependencies], ensure_ascii=False,
+            )
+            messages.append({"role": "user", "content": dependency_context})
+        messages.extend(_to_openai_messages(self._trim_window(history)))
+        child.update({
+            "intent": task["intent"], "active_task": task, "effective_messages": history,
+            "openai_messages": messages, "answer": "", "usage": None, "trace": [],
+            "tool_trace": [], "citations": [], "task_results": [], "approval_form": None,
+            "booking_draft": None, "policy_constraints": None, "policy_validation": None,
+            "travel_attempt": 0, "travel_retry_count": 0, "travel_retry_feedback": None,
+            "travel_retry_exhausted": False, "risk_level": "low", "answer_mode": None,
+            "verification": None, "claim_evidence_map": [], "rag_correction_count": 0,
+            "reflection_notes": "",
+            "dependency_context": dependency_context,
+        })
+        return child
+
+    @staticmethod
+    def _task_result(task: dict[str, Any], state: TravelGraphState) -> dict[str, Any]:
+        result = {key: state.get(key) for key in (
+            "answer", "usage", "citations", "verification", "claim_evidence_map", "answer_mode",
+            "booking_draft", "approval_form", "policy_constraints", "policy_validation",
+            "risk_level", "rag_correction_count", "travel_retry_exhausted",
+        )}
+        needs_review = (
+            state.get("risk_level") == "high" or state.get("answer_mode") == "llm_fallback"
+            or (state.get("verification") or {}).get("passed") is False
+            or (state.get("policy_validation") or {}).get("status") in {"failed", "needs_review"}
+        )
+        result.update({
+            "task_id": task["id"], "intent": task["intent"], "request": task["request"],
+            "status": "needs_review" if needs_review else "completed",
+            "tool_trace": [{**item, "task_id": task["id"]} for item in state.get("tool_trace") or []],
+            "trace": [{**item, "task_id": task["id"]} for item in state.get("trace") or []],
+        })
+        return result
+
+    async def _execute_planned_task(
+        self, state: TravelGraphState, task: dict[str, Any], dependencies: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        result = await self._task_graph.ainvoke(
+            self._task_state(state, task, dependencies),
+            config={"recursion_limit": 20 + 5 * max(0, settings.travel_validation_max_retries)},
+        )
+        return self._task_result(task, result)
+
+    async def _multi_task_executor(
+        self, state: TravelGraphState
+    ) -> Command[Literal["response_finalizer"]]:
+        tasks = state["execution_plan"]["tasks"]
+
+        async def runner(task: dict[str, Any], dependencies: list[dict[str, Any]]) -> dict[str, Any]:
+            return await self._execute_planned_task(state, task, dependencies)
+
+        results = await execute_task_plan(
+            tasks, runner, max_concurrency=settings.task_max_concurrency,
+            timeout_seconds=settings.task_timeout_seconds,
+        )
+        sections: list[str] = []
+        citations: list[dict[str, Any]] = []
+        trace = list(state.get("trace") or [])
+        status_labels = {"completed": "已完成", "needs_review": "需复核", "failed": "失败", "blocked": "未执行"}
+        for index, result in enumerate(results, start=1):
+            # Each child was already verified against its own citations. Renumber only
+            # after verification, keeping claim-evidence maps local to each task.
+            offset = len(citations)
+            local_citations = result.get("citations") or []
+            answer = result.get("answer") or "该任务未返回结果。"
+            if local_citations:
+                answer = re.sub(
+                    r"\[(\d+)\]",
+                    lambda match: f"[{int(match[1]) + offset}]"
+                    if 1 <= int(match[1]) <= len(local_citations) else match[0], answer,
+                )
+                citations.extend({**item, "metadata": {
+                    **(item.get("metadata") or {}), "task_id": result["task_id"],
+                }} for item in local_citations)
+            sections.append(
+                f"{index}. {result['request']}（{status_labels[result['status']]}）\n\n{answer}"
+            )
+            trace.extend(result.get("trace") or [])
+        risk_order = {"low": 0, "medium": 1, "high": 2}
+        return Command(update={
+            "answer": "\n\n".join(sections), "task_results": results, "citations": citations,
+            "usage": self._sum_usage(*(result.get("usage") for result in results)),
+            "tool_trace": [item for result in results for item in result.get("tool_trace") or []],
+            "risk_level": max((result.get("risk_level") or "low" for result in results), key=risk_order.get),
+            "verification": {"scope": "per_task", "tasks": {
+                result["task_id"]: {"status": result["status"], "verification": result.get("verification")}
+                for result in results
+            }},
+            "trace": self._append_trace({**state, "trace": trace}, "multi_task_executor", "completed",
+                                        {"task_count": len(results)}),
+        }, goto="response_finalizer")
 
     def _route_after_answer(
         self, state: TravelGraphState
@@ -392,6 +634,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 "role": "user",
                 "content": (
                     f"{state.get('memory_context', '')}\n\n"
+                    f"{state.get('dependency_context', '')}\n\n"
                     f"参考资料：\n{context or '无'}\n\n用户问题：{text}"
                 ),
             },
@@ -425,7 +668,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 {
                     "role": "system",
                     "content": "执行计划（由 planner 节点生成）：\n"
-                    + json.dumps(state["execution_plan"], ensure_ascii=False),
+                    + json.dumps(state.get("active_task") or state["execution_plan"], ensure_ascii=False),
                 }
             )
         if state.get("policy_constraints"):
@@ -454,6 +697,14 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 }
             )
         tools = _travel_tools()
+        search_tools = {
+            TravelIntent.SEARCH_FLIGHT.value: "search_flights",
+            TravelIntent.SEARCH_HOTEL.value: "search_hotels",
+            TravelIntent.SEARCH_TRAIN.value: "search_trains",
+        }
+        if state.get("intent") in search_tools:
+            tools = [tool for tool in tools if tool["function"]["name"] == search_tools[state["intent"]]]
+        allowed_tools = {tool["function"]["name"] for tool in tools}
         tool_trace: list[dict[str, Any]] = list(state.get("tool_trace") or [])
         usage: dict[str, int] | None = None
         user_text = self._last_user_text(state.get("effective_messages") or state["messages"])
@@ -483,6 +734,8 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                     }
                 )
                 for tc in msg.tool_calls:
+                    if tc.function.name not in allowed_tools:
+                        raise ValueError("Tool call does not belong to the current task")
                     output = await self._execute_tool(tc.function.name, tc.function.arguments, user_text)
                     tool_trace.append(
                         {
@@ -851,31 +1104,36 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         )
 
     async def _response_finalizer(self, state: TravelGraphState) -> dict[str, Any]:
-        answer = self._enforce_enterprise_answer_contract(
-            state.get("answer", ""),
-            self._current_attempt_tool_trace(state),
-            state.get("effective_messages", state["messages"]),
-        )
+        answer = state.get("answer", "")
+        if state.get("route") not in {"multi_task", "clarification"}:
+            answer = (await self._finish_task(state))["answer"]
         session_id = state.get("session_id")
         booking_draft = state.get("booking_draft")
         if session_id:
             await self._save_session_messages(
                 session_id,
-                state.get("effective_messages", state["messages"])
+                (state.get("conversation_messages") or state.get("effective_messages", state["messages"]))
                 + [ChatMessage(role=MessageRole.ASSISTANT, content=answer)],
             )
         if booking_draft:
             await self._save_booking_draft(session_id, booking_draft)
+        for result in state.get("task_results") or []:
+            if result.get("booking_draft"):
+                # Each draft is addressable by id; do not arbitrarily choose a "latest"
+                # draft for a conversation containing several independent plans.
+                await self._save_booking_draft(None, result["booking_draft"])
         return {
             "response": {
                 "id": str(uuid.uuid4()),
                 "created": int(time.time()),
                 "model": self._llm.model,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": answer}}],
-                "usage": state.get("usage"),
+                "usage": self._sum_usage(state.get("planner_usage"), state.get("usage")),
                 "metadata": {
                     "orchestrator": "langgraph",
                     "intent": state.get("intent"),
+                    "route": state.get("route"),
+                    "task_results": state.get("task_results") or [],
                     "tool_trace": state.get("tool_trace") or [],
                     "execution_plan": state.get("execution_plan"),
                     "policy_constraints": state.get("policy_constraints"),
@@ -912,7 +1170,8 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         user_id: str | None = None,
     ) -> dict[str, Any]:
         result = await self._graph.ainvoke(
-            {"messages": messages, "session_id": session_id, "user_id": user_id}
+            {"messages": messages, "session_id": session_id, "user_id": user_id},
+            config={"recursion_limit": 30 + 5 * max(0, settings.travel_validation_max_retries)},
         )
         return result["response"]
 
@@ -1037,91 +1296,6 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             return {}
         return value if isinstance(value, dict) else {}
 
-    @staticmethod
-    def _coerce_execution_plan(raw: dict[str, Any], user_text: str) -> dict[str, Any]:
-        fallback = LangGraphTravelOrchestrator._fallback_execution_plan(user_text)
-        if not raw:
-            return fallback
-        allowed_tools = {
-            "recommend_travel_options",
-            "search_flights",
-            "search_trains",
-            "search_hotels",
-            "check_travel_policy",
-            "rag_policy_lookup",
-        }
-        tools = [
-            str(item)
-            for item in raw.get("required_tools", [])
-            if str(item) in allowed_tools
-        ]
-        if not tools:
-            tools = fallback["required_tools"]
-        steps = raw.get("steps")
-        if not isinstance(steps, list) or not steps:
-            steps = fallback["steps"]
-        normalized_steps: list[dict[str, Any]] = []
-        for index, item in enumerate(steps, start=1):
-            if isinstance(item, dict):
-                tool = str(item.get("tool") or "")
-                normalized_steps.append(
-                    {
-                        "order": int(item.get("order") or index),
-                        "tool": tool if tool in allowed_tools else "",
-                        "reason": str(item.get("reason") or item.get("task") or ""),
-                    }
-                )
-            else:
-                normalized_steps.append({"order": index, "tool": "", "reason": str(item)})
-        slots = raw.get("slots") if isinstance(raw.get("slots"), dict) else fallback["slots"]
-        missing = raw.get("missing_slots") if isinstance(raw.get("missing_slots"), list) else []
-        return {
-            "goal": str(raw.get("goal") or fallback["goal"]),
-            "slots": slots,
-            "required_tools": tools,
-            "missing_slots": [str(item) for item in missing],
-            "steps": normalized_steps,
-            "needs_clarification": bool(raw.get("needs_clarification", False)),
-            "rationale": str(raw.get("rationale") or fallback["rationale"]),
-            "planner": "llm",
-        }
-
-    @staticmethod
-    def _fallback_execution_plan(user_text: str, error: str | None = None) -> dict[str, Any]:
-        tools: list[str] = []
-        steps: list[dict[str, Any]] = []
-        lower = user_text.lower()
-        if any(word in user_text for word in ("政策", "制度", "差标", "报销", "审批", "标准")):
-            tools.append("rag_policy_lookup")
-            steps.append({"order": len(steps) + 1, "tool": "rag_policy_lookup", "reason": "检索企业差旅制度约束"})
-        if any(word in user_text for word in ("航班", "机票", "飞机")):
-            tools.append("search_flights")
-            steps.append({"order": len(steps) + 1, "tool": "search_flights", "reason": "查询航班候选"})
-        if any(word in user_text for word in ("高铁", "火车", "动车", "车次")):
-            tools.append("search_trains")
-            steps.append({"order": len(steps) + 1, "tool": "search_trains", "reason": "查询高铁/火车候选"})
-        if any(word in user_text for word in ("酒店", "住宿")):
-            tools.append("search_hotels")
-            steps.append({"order": len(steps) + 1, "tool": "search_hotels", "reason": "查询酒店候选"})
-        if any(word in user_text for word in ("规划", "推荐", "安排", "出差", "差旅", "booking", "预订")) or "trip" in lower:
-            tools = ["recommend_travel_options"]
-            steps = [{"order": 1, "tool": "recommend_travel_options", "reason": "综合查询交通和酒店并形成推荐组合"}]
-        if not tools:
-            tools = []
-            steps = [{"order": 1, "tool": "", "reason": "直接回答通用问题"}]
-        rationale = "基于关键词兜底生成执行计划"
-        if error:
-            rationale = f"{rationale}；LLM planner 失败：{error}"
-        return {
-            "goal": user_text[:120],
-            "slots": {},
-            "required_tools": tools,
-            "missing_slots": [],
-            "steps": steps,
-            "needs_clarification": False,
-            "rationale": rationale,
-            "planner": "fallback",
-        }
 
     async def _extract_policy_constraints(
         self,
@@ -1217,65 +1391,6 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 return "预订前需要补充出发日期、出发城市、目的城市和员工职级；当前信息不足，暂不执行预订。"
         return None
 
-    @staticmethod
-    def _is_inventory_or_planning_request(text: str) -> bool:
-        action_words = (
-            "查询",
-            "查一下",
-            "看看",
-            "推荐",
-            "比较",
-            "规划",
-            "安排",
-            "生成行程",
-            "制定行程",
-            "商旅规划",
-            "出差方案",
-        )
-        inventory_words = (
-            "航班",
-            "机票",
-            "飞机",
-            "高铁",
-            "火车",
-            "动车",
-            "车次",
-            "酒店",
-            "住宿",
-            "北京",
-            "上海",
-            "广州",
-            "深圳",
-            "杭州",
-        )
-        return any(w in text for w in action_words) and any(w in text for w in inventory_words)
-
-    @staticmethod
-    def _should_use_rag(intent: str | None, text: str) -> bool:
-        if LangGraphTravelOrchestrator._is_inventory_or_planning_request(text):
-            return False
-        if intent in {TravelIntent.RAG.value, TravelIntent.INFO_QUERY.value}:
-            return True
-        policy_words = (
-            "制度",
-            "政策",
-            "报销",
-            "标准",
-            "差标",
-            "发票",
-            "审批",
-            "补贴",
-            "舱位",
-            "酒店",
-            "提前",
-            "金额",
-            "预订",
-        )
-        question_indicators = ("几天", "多少", "要求", "标准", "可以", "吗", "是什么", "怎么安排")
-        if any(w in text for w in policy_words) and any(q in text for q in question_indicators):
-            return True
-        action_words = ("规划", "安排", "生成行程", "检查差标", "预订", "下单")
-        return any(w in text for w in policy_words) and not any(w in text for w in action_words)
 
     async def _llm_fallback_answer(
         self,
@@ -1704,7 +1819,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         validation: dict[str, Any],
     ) -> dict[str, Any]:
         draft = booking_draft or {}
-        slots_payload = state.get("execution_plan") or {}
+        slots_payload = state.get("active_task") or state.get("execution_plan") or {}
         slots = slots_payload.get("slots") if isinstance(slots_payload, dict) else {}
         slots = slots if isinstance(slots, dict) else {}
         result = dict(form or {})
@@ -2181,6 +2296,14 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 if line.strip().startswith("-")
             ]
         return []
+
+    @staticmethod
+    def _sum_usage(*items: dict[str, int] | None) -> dict[str, int] | None:
+        values = [item for item in items if item is not None]
+        if not values:
+            return None
+        return {key: sum(item.get(key, 0) or 0 for item in values)
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
 
     @staticmethod
     def _usage_dict(resp: Any) -> dict[str, int]:

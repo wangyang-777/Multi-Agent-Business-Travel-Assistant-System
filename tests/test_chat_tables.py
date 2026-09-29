@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from app.api.routes.chat import _build_response_tables
+import pytest
+
+from app.api.routes.chat import _build_response_tables, chat
+from app.domain.schemas import ChatRequest, ChatResponse
 
 
 def test_build_response_tables_from_tool_trace() -> None:
@@ -298,3 +301,178 @@ def test_build_response_tables_from_markdown_content_fallback() -> None:
     assert [table.title for table in tables] == ["推荐航班方案"]
     assert tables[0].columns == ["航班", "时间", "价格"]
     assert tables[0].rows[0] == {"航班": "CA1501", "时间": "08:30-10:55", "价格": "¥1500"}
+
+
+def test_unified_plan_tables_show_task_dependencies_and_missing_parameters() -> None:
+    raw = {
+        "metadata": {
+            "execution_plan": {
+                "primary_intent": "search_flight",
+                "tasks": [
+                    {
+                        "id": "task_1",
+                        "intent": "search_flight",
+                        "request": "查询北京到上海的航班",
+                        "slots": {"departure": "北京", "destination": "上海"},
+                        "depends_on": [],
+                        "missing_slots": ["date"],
+                    },
+                    {
+                        "id": "task_2",
+                        "intent": "policy",
+                        "request": "核对候选航班的差旅标准",
+                        "slots": {},
+                        "depends_on": ["task_1"],
+                        "missing_slots": [],
+                    },
+                ],
+                "clarification_question": "请问哪天出发？",
+            }
+        }
+    }
+
+    tables = _build_response_tables(raw)
+
+    assert [table.title for table in tables] == ["执行计划", "任务列表"]
+    assert tables[0].rows[-1]["内容"] == "请问哪天出发？"
+    assert tables[1].rows[0] == {
+        "任务 ID": "task_1",
+        "意图": "search_flight",
+        "任务说明": "查询北京到上海的航班",
+        "前置任务": "无",
+        "缺失参数": "date",
+    }
+    assert tables[1].rows[1]["前置任务"] == "task_1"
+
+
+def test_retry_does_not_hide_results_from_other_tasks() -> None:
+    raw = {
+        "metadata": {
+            "tool_trace": [
+                {
+                    "task_id": "flight",
+                    "attempt": 1,
+                    "output": '{"mode":"flight","results":[{"flight_no":"OLD"}]}',
+                },
+                {
+                    "task_id": "flight",
+                    "attempt": 2,
+                    "output": '{"mode":"flight","results":[{"flight_no":"NEW"}]}',
+                },
+                {
+                    "task_id": "hotel",
+                    "attempt": 1,
+                    "output": '{"mode":"hotel","results":[{"name":"上海酒店"}]}',
+                },
+            ]
+        }
+    }
+
+    tables = _build_response_tables(raw)
+
+    assert [table.title for table in tables] == ["flight · 航班候选", "hotel · 酒店候选"]
+    assert tables[0].rows[0]["航班"] == "NEW"
+    assert tables[1].rows[0]["酒店"] == "上海酒店"
+
+
+def test_multi_task_tables_include_each_draft_and_approval_form() -> None:
+    raw = {
+        "metadata": {
+            "route": "multi_task",
+            "task_results": [
+                {
+                    "task_id": "trip_a",
+                    "intent": "booking",
+                    "request": "生成上海行程草稿",
+                    "status": "needs_review",
+                    "booking_draft": {"draft_id": "draft_a"},
+                    "approval_form": {"required": True, "reason": "超出差标"},
+                    "tool_trace": [
+                        {
+                            "attempt": 1,
+                            "output": '{"mode":"flight","results":[{"flight_no":"CA1234"}]}',
+                        }
+                    ],
+                },
+                {
+                    "task_id": "trip_b",
+                    "intent": "booking",
+                    "request": "生成深圳行程草稿",
+                    "status": "completed",
+                    "booking_draft": {"draft_id": "draft_b"},
+                    "approval_form": {"required": False},
+                },
+                {
+                    "task_id": "policy",
+                    "intent": "policy",
+                    "request": "查询报销流程",
+                    "status": "failed",
+                },
+            ],
+        }
+    }
+
+    tables = _build_response_tables(raw)
+
+    by_title = {table.title: table for table in tables}
+    assert by_title["trip_a · 预订草稿"].rows[0]["内容"] == "draft_a"
+    assert by_title["trip_b · 预订草稿"].rows[0]["内容"] == "draft_b"
+    assert by_title["trip_a · 审批表单"].rows[0]["内容"] == "是"
+    assert by_title["trip_b · 审批表单"].rows[0]["内容"] == "否"
+    assert by_title["任务执行结果"].rows[2]["状态"] == "执行失败"
+    assert by_title["trip_a · 航班候选"].rows[0]["航班"] == "CA1234"
+
+
+@pytest.mark.asyncio
+async def test_chat_exposes_task_results_and_routing_metadata() -> None:
+    class FakeOrchestrator:
+        async def run_completion(self, messages, **kwargs):
+            return {
+                "id": "response_1",
+                "created": 1,
+                "model": "test",
+                "choices": [{"message": {"role": "assistant", "content": "查询完成"}}],
+                "metadata": {
+                    "route": "multi_task",
+                    "intent": "search_flight",
+                    "task_results": [
+                        {
+                            "task_id": "task_1",
+                            "intent": "search_flight",
+                            "request": "查航班",
+                            "status": "completed",
+                            "answer": "已找到航班",
+                            "usage": {"total_tokens": 10},
+                        },
+                        {
+                            "task_id": "task_2",
+                            "intent": "policy",
+                            "request": "查报销政策",
+                            "status": "completed",
+                            "answer": "按制度报销[policy_1]",
+                            "citations": [{"chunk_id": "policy_1", "content": "报销制度"}],
+                            "verification": {"grounded": True},
+                            "claim_evidence_map": [
+                                {"claim": "按制度报销", "chunk_ids": ["policy_1"]}
+                            ],
+                        },
+                    ],
+                },
+            }
+
+    response = await chat(
+        ChatRequest(messages=[{"role": "user", "content": "查航班并说明报销政策"}]),
+        None,  # type: ignore[arg-type]
+        orchestrator=FakeOrchestrator(),  # type: ignore[arg-type]
+    )
+
+    assert isinstance(response, ChatResponse)
+    payload = response.model_dump(mode="json")
+    assert payload["route"] == "multi_task"
+    assert payload["intent"] == "search_flight"
+    assert [item["task_id"] for item in payload["task_results"]] == ["task_1", "task_2"]
+    assert payload["task_results"][1]["citations"][0]["chunk_id"] == "policy_1"
+    assert payload["task_results"][1]["verification"] == {"grounded": True}
+    assert payload["task_results"][0]["usage"] == {"total_tokens": 10}
+    assert payload["booking_draft"] is None
+    assert payload["approval_form"] is None

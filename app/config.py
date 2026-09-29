@@ -1,3 +1,6 @@
+from typing import Literal
+
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -46,6 +49,10 @@ class Settings(BaseSettings):
     agent_orchestrator_backend: str = "langgraph"
     max_react_iterations: int = 10
     travel_validation_max_retries: int = 1
+    planner_response_format: Literal["json_schema", "json_object"] = "json_schema"
+    planner_timeout_seconds: float = Field(default=30.0, gt=0)
+    task_max_concurrency: int = Field(default=3, ge=1, le=8)
+    task_timeout_seconds: float = Field(default=120.0, gt=0)
     memory_window_size: int = 20
     memory_summary_threshold: int = 15
     memory_max_messages: int = 40

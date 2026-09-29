@@ -94,6 +94,24 @@ class BookingDraft(BaseModel):
     expires_at: str
 
 
+class TaskResult(BaseModel):
+    task_id: str
+    intent: str
+    request: str
+    status: Literal["completed", "needs_review", "failed", "blocked"]
+    answer: str = ""
+    citations: list[ResponseCitation] = Field(default_factory=list)
+    tool_trace: list[dict[str, Any]] = Field(default_factory=list)
+    verification: dict[str, Any] | None = None
+    claim_evidence_map: list[dict[str, Any]] = Field(default_factory=list)
+    booking_draft: BookingDraft | None = None
+    approval_form: ApprovalForm | None = None
+    policy_constraints: dict[str, Any] | None = None
+    policy_validation: dict[str, Any] | None = None
+    risk_level: Literal["low", "medium", "high"] | None = None
+    usage: dict[str, int] | None = None
+
+
 class ChatResponse(BaseModel):
     id: str
     object: Literal["chat.completion"] = "chat.completion"
@@ -108,6 +126,9 @@ class ChatResponse(BaseModel):
     approval_form: Optional[ApprovalForm] = None
     booking_draft: Optional[BookingDraft] = None
     execution_plan: Optional[dict[str, Any]] = None
+    route: str | None = None
+    intent: str | None = None
+    task_results: list[TaskResult] = Field(default_factory=list)
     policy_constraints: Optional[dict[str, Any]] = None
     policy_validation: Optional[dict[str, Any]] = None
     travel_retry: Optional[dict[str, Any]] = None
