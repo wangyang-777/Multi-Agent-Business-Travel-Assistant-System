@@ -27,11 +27,17 @@ class _FakeLLM:
     async def chat_completion(self, messages, **kwargs):  # type: ignore[no-untyped-def]
         self.calls += 1
         self.messages.append(messages)
+        content = (
+            '{"primary_intent":"general","tasks":[{"id":"task_1",'
+            '"intent":"general","request":"你好","slots":{},'
+            '"depends_on":[],"missing_slots":[]}],"clarification_question":null}'
+            if kwargs.get("response_format") else "图编排回复"
+        )
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
                     message=SimpleNamespace(
-                        content="图编排回复",
+                        content=content,
                         tool_calls=None,
                     )
                 )
@@ -50,11 +56,13 @@ class _RetryFlowLLM:
         self.calls += 1
         if self.calls == 1:
             content = (
-                '{"goal":"生成合规差旅行程","slots":{},'
-                '"required_tools":["recommend_travel_options"],'
-                '"missing_slots":[],"steps":[{"order":1,'
-                '"tool":"recommend_travel_options","reason":"查询候选"}],'
-                '"needs_clarification":false,"rationale":"需要综合推荐"}'
+                '{"primary_intent":"trip_planning","tasks":[{"id":"task_1",'
+                '"intent":"trip_planning",'
+                '"request":"我是staff，请推荐2026-10-20从北京到上海的航班、高铁和酒店",'
+                '"slots":{"employee_id":"u1","grade":"staff",'
+                '"origin_city":"北京","destination_city":"上海",'
+                '"departure_date":"2026-10-20"},'
+                '"depends_on":[],"missing_slots":[]}],"clarification_question":null}'
             )
             tool_calls = None
         elif self.calls in {2, 4}:
@@ -112,9 +120,9 @@ async def test_langgraph_orchestrator_keeps_chat_response_shape() -> None:
     assert result["model"] == "fake-model"
     assert result["choices"][0]["message"]["content"] == "图编排回复"
     assert result["usage"] == {
-        "prompt_tokens": 2,
-        "completion_tokens": 3,
-        "total_tokens": 5,
+        "prompt_tokens": 4,
+        "completion_tokens": 6,
+        "total_tokens": 10,
     }
     assert result["metadata"]["orchestrator"] == "langgraph"
     assert result["metadata"]["trace"]

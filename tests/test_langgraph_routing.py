@@ -8,7 +8,7 @@ def test_inventory_planning_request_routes_through_policy_reasoner() -> None:
     orch = LangGraphTravelOrchestrator()
 
     route = orch._route_after_intent(
-        TravelIntent.POLICY.value,
+        TravelIntent.TRIP_PLANNING.value,
         "我是staff，下周一从北京到上海出差一天，请综合推荐航班、高铁和酒店，并做差标提醒",
     )
 

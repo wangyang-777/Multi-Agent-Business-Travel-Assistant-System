@@ -133,8 +133,9 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         return Command(goto=self._route_after_intent(state.get("intent")))
 
     async def _finish_task(self, state: TravelGraphState) -> dict[str, Any]:
+        inventory_issue = self._inventory_issue(state)
         return {"answer": self._enforce_enterprise_answer_contract(
-            state.get("answer", ""), self._current_attempt_tool_trace(state),
+            inventory_issue or state.get("answer", ""), self._current_attempt_tool_trace(state),
             state.get("effective_messages") or state["messages"],
         )}
 
@@ -429,10 +430,22 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             "booking_draft", "approval_form", "policy_constraints", "policy_validation",
             "risk_level", "rag_correction_count", "travel_retry_exhausted",
         )}
+        inventory_issue = LangGraphTravelOrchestrator._inventory_issue(state)
+        travel_workflow = task["intent"] in {
+            TravelIntent.TRIP_PLANNING.value,
+            TravelIntent.APPLICATION.value,
+            TravelIntent.BOOKING.value,
+        }
         needs_review = (
-            state.get("risk_level") == "high" or state.get("answer_mode") == "llm_fallback"
+            bool(inventory_issue)
+            or not state.get("answer")
+            or state.get("risk_level") == "high"
+            or state.get("answer_mode") == "llm_fallback"
             or (state.get("verification") or {}).get("passed") is False
-            or (state.get("policy_validation") or {}).get("status") in {"failed", "needs_review"}
+            or (
+                travel_workflow
+                and (state.get("policy_validation") or {}).get("status") in {"failed", "needs_review"}
+            )
         )
         result.update({
             "task_id": task["id"], "intent": task["intent"], "request": task["request"],
@@ -441,6 +454,31 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             "trace": [{**item, "task_id": task["id"]} for item in state.get("trace") or []],
         })
         return result
+
+    @staticmethod
+    def _inventory_issue(state: TravelGraphState) -> str | None:
+        expected = {
+            TravelIntent.SEARCH_FLIGHT.value: ("search_flights", "flight"),
+            TravelIntent.SEARCH_HOTEL.value: ("search_hotels", "hotel"),
+            TravelIntent.SEARCH_TRAIN.value: ("search_trains", "train"),
+        }.get(state.get("intent"))
+        if expected is None:
+            return None
+        tool_name, mode = expected
+        for item in LangGraphTravelOrchestrator._current_attempt_tool_trace(state):
+            if item.get("tool") != tool_name:
+                continue
+            try:
+                payload = json.loads(item.get("output") or "")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(payload, dict) and payload.get("mode") == mode
+                and not payload.get("error") and isinstance(payload.get("results"), list)
+                and any(isinstance(row, dict) for row in payload["results"])
+            ):
+                return None
+        return "当前未能取得可核实的查询结果，不能据此提供库存、价格或余票结论。"
 
     async def _execute_planned_task(
         self, state: TravelGraphState, task: dict[str, Any], dependencies: list[dict[str, Any]]
