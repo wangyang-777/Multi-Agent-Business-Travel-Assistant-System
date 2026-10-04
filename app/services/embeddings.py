@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from openai import AsyncOpenAI
-
 from app.config import settings
+from app.utils.openai_client import create_openai_client
 from app.utils.tokenization import truncate_text_by_tokens
 
 _EMBED_BATCH_SIZE = 10
@@ -17,7 +16,7 @@ class EmbeddingService:
         base_url: str | None = None,
         dimensions: int | None = None,
     ) -> None:
-        self._client = AsyncOpenAI(
+        self._client = create_openai_client(
             api_key=api_key or settings.embedding_api_key or settings.openai_api_key or "dummy",
             base_url=base_url or settings.embedding_base_url,
         )

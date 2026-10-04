@@ -56,12 +56,10 @@ def load_document_from_file(filename: str, data: bytes) -> LoadedDocument:
             loaded = _load_with_unstructured(filename, data)
             if loaded.text.strip():
                 return loaded
-        except ImportError as exc:
-            if suffix not in {".txt", ".md", ".pdf", ".docx"}:
-                raise DocumentLoadError(f"{suffix} 文件需要安装本地 Unstructured 解析依赖") from exc
+        except ImportError:
+            pass
         except Exception:
-            if suffix not in {".txt", ".md", ".pdf", ".docx"}:
-                raise
+            pass
 
     try:
         text = extract_text_from_file(filename, data)

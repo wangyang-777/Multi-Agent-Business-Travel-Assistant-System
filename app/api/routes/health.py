@@ -4,6 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
+from app.config import settings
 from app.domain.schemas import HealthStatus
 
 router = APIRouter(tags=["health"])
@@ -16,7 +17,7 @@ async def health(request: Request) -> HealthStatus:
 
     r = getattr(request.app.state, "redis", None)
     if r is None:
-        checks["redis"] = True
+        checks["redis"] = False
     else:
         try:
             await r.ping()
@@ -27,7 +28,7 @@ async def health(request: Request) -> HealthStatus:
 
     milvus = getattr(request.app.state, "milvus", None)
     if milvus is None:
-        checks["milvus"] = True
+        checks["milvus"] = False
     else:
         checks["milvus"] = milvus.connected
 
@@ -43,7 +44,7 @@ async def health(request: Request) -> HealthStatus:
 
     engine = getattr(request.app.state, "db_engine", None)
     if engine is None:
-        checks["database"] = True
+        checks["database"] = False
     else:
         try:
             from sqlalchemy import text
@@ -57,13 +58,15 @@ async def health(request: Request) -> HealthStatus:
             checks["database"] = False
             detail_parts.append(f"db:{exc!s}")
 
-    status: Any = "ok"
-    if not checks.get("redis", True) or not checks.get("database", True):
-        status = "degraded"
-    elif milvus is not None and not checks.get("milvus", True):
-        status = "degraded"
-    elif not checks.get("keyword_index", False):
-        status = "degraded"
+    checks["chat_model_configured"] = bool(settings.openai_api_key)
+    checks["embedding_model_configured"] = bool(
+        settings.embedding_api_key or settings.openai_api_key
+    )
+    if settings.rag_reranker_enabled:
+        checks["rerank_model_configured"] = bool(
+            settings.rag_reranker_api_key and settings.rag_reranker_url
+        )
+    status: Any = "ok" if all(checks.values()) else "degraded"
 
     return HealthStatus(
         status=status,

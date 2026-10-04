@@ -22,7 +22,7 @@ from app.api.routes import sessions as sessions_routes
 from app.config import settings
 from app.core.logging import configure_logging, get_logger
 from app.core.rag.hybrid import HybridRAGRetriever
-from app.core.rag.reranker import CrossEncoderReranker
+from app.core.rag.reranker import ApiReranker
 from app.services.keyword_index import RedisKeywordIndex
 from app.services.milvus_store import get_milvus_store
 
@@ -73,24 +73,34 @@ async def lifespan(app: FastAPI):
     if store.connected and app.state.keyword_index.connected:
         try:
             existing_chunks = store.list_documents(limit=10000, content_limit=65530)
-            await app.state.keyword_index.upsert_many(
-                {
-                    "chunk_id": str(item.get("id") or ""),
-                    "parent_doc_id": _parent_document_id(str(item.get("id") or "")),
-                    "title": item.get("title"),
-                    "doc_type": item.get("doc_type"),
-                    "text": item.get("content"),
-                    "metadata": {"bootstrap_source": "milvus"},
-                }
-                for item in existing_chunks
+            restored = await app.state.keyword_index.upsert_many(
+                (
+                    {
+                        "chunk_id": str(item.get("id") or ""),
+                        "parent_doc_id": _parent_document_id(str(item.get("id") or "")),
+                        "title": item.get("title"),
+                        "doc_type": item.get("doc_type"),
+                        "text": item.get("content"),
+                        "metadata": {"bootstrap_source": "milvus"},
+                    }
+                    for item in existing_chunks
+                ),
+                overwrite_existing=False,
             )
-            logger.info("keyword_index.bootstrapped", chunks=len(existing_chunks))
+            logger.info(
+                "keyword_index.bootstrapped",
+                scanned=len(existing_chunks), restored=restored,
+            )
         except Exception as exc:
             logger.warning("keyword_index.bootstrap_failed", error=str(exc))
     app.state.rag_retriever = HybridRAGRetriever(
         app.state.milvus,
         app.state.keyword_index,
-        reranker=CrossEncoderReranker(model_name=settings.rag_reranker_model),
+        reranker=ApiReranker(
+            api_key=settings.rag_reranker_api_key,
+            url=settings.rag_reranker_url,
+            model_name=settings.rag_reranker_model,
+        ),
     )
 
     app.state.orchestrator = _create_orchestrator(

@@ -42,7 +42,9 @@ class RedisKeywordIndex:
         await self._redis.hlen(self._key)
         return True
 
-    async def upsert_many(self, documents: Iterable[dict[str, Any]]) -> int:
+    async def upsert_many(
+        self, documents: Iterable[dict[str, Any]], *, overwrite_existing: bool = True
+    ) -> int:
         if self._redis is None:
             raise RuntimeError("keyword index unavailable")
         mapping: dict[str, str] = {}
@@ -55,9 +57,16 @@ class RedisKeywordIndex:
             payload["chunk_id"] = chunk_id
             payload["text"] = text
             mapping[chunk_id] = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        if mapping:
+        if not mapping:
+            return 0
+        if overwrite_existing:
             await self._redis.hset(self._key, mapping=mapping)
-        return len(mapping)
+            return len(mapping)
+        async with self._redis.pipeline(transaction=False) as pipeline:
+            for chunk_id, payload in mapping.items():
+                pipeline.hsetnx(self._key, chunk_id, payload)
+            inserted = await pipeline.execute()
+        return sum(int(result) for result in inserted)
 
     async def search(self, query: str, *, top_k: int) -> list[dict[str, Any]]:
         if self._redis is None:

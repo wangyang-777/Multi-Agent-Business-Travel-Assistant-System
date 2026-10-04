@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from app.api.routes.chat import _build_response_tables, chat
+from app.config import settings
 from app.domain.schemas import ChatRequest, ChatResponse
 
 
@@ -424,7 +425,10 @@ def test_multi_task_tables_include_each_draft_and_approval_form() -> None:
 
 
 @pytest.mark.asyncio
-async def test_chat_exposes_task_results_and_routing_metadata() -> None:
+async def test_chat_exposes_task_results_and_routing_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "openai_api_key", "test")
     class FakeOrchestrator:
         async def run_completion(self, messages, **kwargs):
             return {

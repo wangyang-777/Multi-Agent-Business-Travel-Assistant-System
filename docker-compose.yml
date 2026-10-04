@@ -3,6 +3,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        INSTALL_OPTIONAL_DEPS: ${INSTALL_OPTIONAL_DEPS:-0}
+        INSTALL_FLYAI_CLI: ${INSTALL_FLYAI_CLI:-0}
     ports:
       - "8000:8000"
     volumes:
@@ -13,10 +16,10 @@ services:
       REDIS_URL: redis://redis:6379/0
       MILVUS_HOST: milvus-standalone
       MILVUS_PORT: "19530"
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-changeme}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
-      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-${OPENAI_API_KEY:-changeme}}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.openai.com/v1}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
@@ -27,10 +30,10 @@ services:
       RAG_RRF_K: ${RAG_RRF_K:-60}
       RAG_FUSED_TOP_K: ${RAG_FUSED_TOP_K:-20}
       RAG_FINAL_TOP_K: ${RAG_FINAL_TOP_K:-5}
-      RAG_RERANKER_ENABLED: ${RAG_RERANKER_ENABLED:-true}
+      RAG_RERANKER_ENABLED: ${RAG_RERANKER_ENABLED:-false}
       RAG_RERANKER_MODEL: ${RAG_RERANKER_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}
       KEYWORD_INDEX_REDIS_KEY: ${KEYWORD_INDEX_REDIS_KEY:-knowledge:keyword:chunks}
-      TRAVEL_INVENTORY_PROVIDER: ${TRAVEL_INVENTORY_PROVIDER:-flyai}
+      TRAVEL_INVENTORY_PROVIDER: ${TRAVEL_INVENTORY_PROVIDER:-demo}
       AMADEUS_CLIENT_ID: ${AMADEUS_CLIENT_ID:-}
       AMADEUS_CLIENT_SECRET: ${AMADEUS_CLIENT_SECRET:-}
       AMADEUS_BASE_URL: ${AMADEUS_BASE_URL:-https://test.api.amadeus.com}
@@ -38,7 +41,7 @@ services:
       FLYAI_API_KEY: ${FLYAI_API_KEY:-}
       FLYAI_TIMEOUT_S: ${FLYAI_TIMEOUT_S:-45}
       TRAVEL_SEARCH_MAX_RESULTS: ${TRAVEL_SEARCH_MAX_RESULTS:-5}
-      RAILWAY_12306_SKILL_DIR: ${RAILWAY_12306_SKILL_DIR:-/app/external/12306}
+      RAILWAY_12306_SKILL_DIR: ${RAILWAY_12306_SKILL_DIR-/app/external/12306}
       RAILWAY_12306_NODE_BIN: ${RAILWAY_12306_NODE_BIN:-node}
       RAILWAY_MCP_URL: ${RAILWAY_MCP_URL:-}
       RAILWAY_MCP_TIMEOUT_S: ${RAILWAY_MCP_TIMEOUT_S:-30}
@@ -48,7 +51,7 @@ services:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
       milvus-standalone:
         condition: service_healthy
 
@@ -75,6 +78,11 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   etcd:
     image: milvusdb/etcd:3.5.5-r2

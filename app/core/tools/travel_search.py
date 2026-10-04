@@ -429,10 +429,18 @@ async def _search_trains_via_12306_skill(req: TrainSearchRequest) -> dict[str, A
 
     cmd = _build_12306_skill_command(req)
     try:
+        node_env = os.environ.copy()
+        # Node 24+ otherwise ignores HTTP_PROXY/HTTPS_PROXY for built-in fetch.
+        node_env.setdefault("NODE_USE_ENV_PROXY", "1")
+        cache_root = Path(node_env.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+        node_env.setdefault(
+            "RAILWAY_12306_CACHE_FILE", str(cache_root / "travel-agent-12306" / "stations.json")
+        )
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=node_env,
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(),
@@ -929,20 +937,21 @@ class FlyAITravelInventoryProvider:
 
 
 def _provider() -> TravelInventoryProvider:
-    if settings.travel_inventory_provider.lower() == "flyai":
+    provider = settings.travel_inventory_provider.lower()
+    if provider == "demo":
+        return DemoTravelInventoryProvider()
+    if provider == "flyai":
         return FlyAITravelInventoryProvider()
-    if (
-        settings.travel_inventory_provider.lower() == "amadeus"
-        and settings.amadeus_client_id
-        and settings.amadeus_client_secret
-    ):
+    if provider == "amadeus":
+        if not settings.amadeus_client_id or not settings.amadeus_client_secret:
+            raise RuntimeError("Amadeus 未配置 CLIENT_ID 或 CLIENT_SECRET")
         return AmadeusTravelInventoryProvider()
-    return DemoTravelInventoryProvider()
+    raise ValueError(f"未知航班/酒店供应商: {provider}")
 
 
 async def search_flights(req: FlightSearchRequest) -> dict[str, Any]:
-    provider = _provider()
     try:
+        provider = _provider()
         results = await provider.search_flights(req)
     except Exception as exc:  # noqa: BLE001
         provider_name = settings.travel_inventory_provider.lower()
@@ -969,8 +978,8 @@ async def search_flights(req: FlightSearchRequest) -> dict[str, Any]:
 
 
 async def search_hotels(req: HotelSearchRequest) -> dict[str, Any]:
-    provider = _provider()
     try:
+        provider = _provider()
         results = await provider.search_hotels(req)
     except Exception as exc:  # noqa: BLE001
         provider_name = settings.travel_inventory_provider.lower()

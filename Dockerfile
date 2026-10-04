@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 FROM python:3.11-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -16,10 +15,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr-chi-sim \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @fly-ai/flyai-cli
+ARG INSTALL_FLYAI_CLI=0
+RUN if [ "$INSTALL_FLYAI_CLI" = "1" ]; then npm install -g @fly-ai/flyai-cli; fi
 
-COPY requirements.txt .
+ARG INSTALL_OPTIONAL_DEPS=0
+COPY requirements.txt requirements-optional.txt ./
 RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN if [ "$INSTALL_OPTIONAL_DEPS" = "1" ]; then pip install -r requirements-optional.txt; fi
 
 COPY pyproject.toml .
 COPY app ./app

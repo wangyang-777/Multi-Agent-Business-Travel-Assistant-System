@@ -5,10 +5,11 @@ import re
 from collections.abc import AsyncIterator
 from typing import Any, Union
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app.agent.orchestrator import TravelOrchestrator
+from app.config import settings
 from app.domain.schemas import (
     ApprovalForm,
     BookingDraft,
@@ -708,6 +709,8 @@ async def chat(
     request: Request,
     orchestrator: TravelOrchestrator = Depends(get_orchestrator),
 ) -> Union[ChatResponse, StreamingResponse]:
+    if not settings.openai_api_key:
+        raise HTTPException(status_code=503, detail="请在 .env 中配置 OPENAI_API_KEY 后重启服务")
     if body.stream:
 
         async def event_gen() -> AsyncIterator[str]:

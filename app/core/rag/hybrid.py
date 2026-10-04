@@ -1,4 +1,4 @@
-"""Online hybrid retrieval: keyword + dense recall, RRF and Cross-Encoder rerank."""
+"""Online hybrid retrieval: keyword + dense recall, RRF and API rerank."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any
 
 from app.config import settings
 from app.core.logging import get_logger
-from app.core.rag.reranker import CrossEncoderReranker
+from app.core.rag.reranker import ApiReranker
 from app.core.rag.retriever import RetrievedChunk
 
 logger = get_logger(__name__)
@@ -20,7 +20,7 @@ class HybridRAGRetriever:
         vector_store: Any,
         keyword_index: Any,
         *,
-        reranker: CrossEncoderReranker | None = None,
+        reranker: ApiReranker | None = None,
     ) -> None:
         self._vector_store = vector_store
         self._keyword_index = keyword_index
@@ -87,21 +87,16 @@ class HybridRAGRetriever:
                 for item in fused
             ]
             try:
-                reranked = await asyncio.to_thread(
-                    self._reranker.rerank_as_chunks,
-                    query,
-                    chunks,
-                    top_k=final_k,
-                )
+                reranked = await self._reranker.rerank_as_chunks(query, chunks, top_k=final_k)
                 ranked = []
                 for result in reranked:
                     item = dict(result.metadata)
                     item["chunk_id"] = result.chunk_id
                     item["content"] = result.text
                     item["rerank_score"] = result.score
-                    item["rerank_status"] = "cross_encoder"
+                    item["rerank_status"] = "api"
                     ranked.append(item)
-                rerank_status = "cross_encoder"
+                rerank_status = "api"
             except Exception as exc:  # noqa: BLE001
                 rerank_status = "rrf_fallback"
                 logger.warning("rag.reranker_unavailable", error=str(exc))

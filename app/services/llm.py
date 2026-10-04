@@ -2,15 +2,14 @@ from __future__ import annotations
 
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
-from openai import AsyncOpenAI
-
 from app.config import settings
 from app.core.circuit_breaker import CircuitBreaker
+from app.utils.openai_client import create_openai_client
 
 
 class LLMService:
     def __init__(self) -> None:
-        self._client = AsyncOpenAI(
+        self._client = create_openai_client(
             api_key=settings.openai_api_key or "dummy",
             base_url=settings.openai_base_url,
         )

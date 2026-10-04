@@ -40,19 +40,25 @@ def apply_review(*, cases_path: Path, review_csv_path: Path) -> list[dict[str, A
             case_id = str(row.get("id") or "")
             if case_id not in cases:
                 continue
-            decision = str(row.get("reviewer_decision") or "keep").strip().lower()
+            decision = str(row.get("reviewer_decision") or "").strip().lower()
             if decision in {"drop", "reject", "删除", "丢弃"}:
+                continue
+            if decision not in {"keep", "approve", "保留", "通过", "fix", "修正"}:
                 continue
 
             item = dict(cases[case_id])
             corrected_question = str(row.get("corrected_question") or "").strip()
+            corrected_answer = str(row.get("corrected_answer") or "").strip()
             corrected_ids = _parse_ids(str(row.get("corrected_relevant_ids") or ""))
-            if decision in {"fix", "修正"} or corrected_question or corrected_ids:
+            if decision in {"fix", "修正"} or corrected_question or corrected_answer or corrected_ids:
                 if corrected_question:
                     item["question"] = corrected_question
+                if corrected_answer:
+                    item["expected_answer"] = corrected_answer
                 if corrected_ids:
                     item["relevant_ids"] = corrected_ids
                     item["expected_doc_ids"] = corrected_ids
+                    item["relevance_groups"] = [[value] for value in corrected_ids]
                 item["review"] = {
                     "status": "fixed",
                     "notes": str(row.get("notes") or "").strip(),

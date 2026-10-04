@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
@@ -24,8 +25,14 @@ class Settings(BaseSettings):
     rag_rrf_k: int = 60
     rag_fused_top_k: int = 20
     rag_final_top_k: int = 5
-    rag_reranker_enabled: bool = True
-    rag_reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rag_semantic_pdf_enabled: bool = True
+    rag_semantic_min_chars: int = Field(default=100, ge=1)
+    rag_semantic_target_chars: int = Field(default=180, ge=1)
+    rag_semantic_max_chars: int = Field(default=300, ge=1)
+    rag_reranker_enabled: bool = False
+    rag_reranker_api_key: str = ""
+    rag_reranker_url: str = ""
+    rag_reranker_model: str = "qwen3.7-text-rerank"
     keyword_index_redis_key: str = "knowledge:keyword:chunks"
     travel_inventory_provider: str = "demo"
     amadeus_client_id: str = ""
@@ -35,7 +42,9 @@ class Settings(BaseSettings):
     flyai_api_key: str = ""
     flyai_timeout_s: float = 45.0
     travel_search_max_results: int = 5
-    railway_12306_skill_dir: str = ""
+    railway_12306_skill_dir: str = str(
+        Path(__file__).resolve().parent.parent / "external" / "12306"
+    )
     railway_12306_node_bin: str = "node"
     railway_mcp_url: str = ""
     railway_mcp_timeout_s: float = 30.0

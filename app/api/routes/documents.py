@@ -18,6 +18,11 @@ from app.etl.pipeline import (
     parse_plain_text,
     stable_chunk_id,
 )
+from app.etl.semantic_chunking import (
+    expand_table_rows,
+    group_pdf_articles,
+    split_on_embedding_similarity,
+)
 from app.services.document_loader import (
     SUPPORTED_DOCUMENT_EXTENSIONS,
     DocumentLoadError,
@@ -29,6 +34,14 @@ from app.services.milvus_store import new_doc_id, utc_now
 router = APIRouter(tags=["documents"])
 
 
+def _require_embedding_configured() -> None:
+    if not (settings.embedding_api_key or settings.openai_api_key):
+        raise HTTPException(
+            status_code=503,
+            detail="请在 .env 中配置 EMBEDDING_API_KEY 或 OPENAI_API_KEY 后重启服务",
+        )
+
+
 @router.post("/documents/ingest", response_model=DocumentIngestResponse)
 async def ingest_document(body: DocumentIngestRequest, request: Request) -> DocumentIngestResponse:
     milvus = getattr(request.app.state, "milvus", None)
@@ -38,6 +51,7 @@ async def ingest_document(body: DocumentIngestRequest, request: Request) -> Docu
     if keyword_index is None or not keyword_index.connected:
         raise HTTPException(status_code=503, detail="关键词索引未连接，无法执行双路入库")
 
+    _require_embedding_configured()
     embedder = EmbeddingService()
     vector = await embedder.embed_text(body.content)
     doc_id = new_doc_id()
@@ -146,16 +160,29 @@ async def _ingest_long_text(
     keyword_index = getattr(request.app.state, "keyword_index", None)
     if keyword_index is None or not keyword_index.connected:
         raise HTTPException(status_code=503, detail="关键词索引未连接，无法执行双路入库")
-    _ = chunk_overlap  # Compatibility-only input; online ingestion always uses a 15% semantic overlap.
+    _ = chunk_overlap  # Compatibility-only input; non-PDF ingestion uses 15% overlap.
 
+    _require_embedding_configured()
     text = parse_plain_text(content)
-    chunks = chunk_document(
-        text,
-        source_format=source_format,
-        max_chars=chunk_size,
-        overlap_ratio=0.15,
-        source_metadata=source_metadata,
-    )
+    embedder = EmbeddingService()
+    if source_format == ".pdf" and settings.rag_semantic_pdf_enabled:
+        chunks = chunk_document(
+            text, source_format=source_format, max_chars=chunk_size,
+            overlap_ratio=0, source_metadata=source_metadata,
+        )
+        chunks = expand_table_rows(group_pdf_articles(chunks))
+        semantic_max = min(chunk_size, settings.rag_semantic_max_chars)
+        semantic_target = min(semantic_max, settings.rag_semantic_target_chars)
+        semantic_min = min(semantic_target, settings.rag_semantic_min_chars)
+        chunks = await split_on_embedding_similarity(
+            chunks, embedder, min_chars=semantic_min,
+            target_chars=semantic_target, max_chars=semantic_max,
+        )
+    else:
+        chunks = chunk_document(
+            text, source_format=source_format, max_chars=chunk_size,
+            overlap_ratio=0.15, source_metadata=source_metadata,
+        )
     chunks = enforce_document_chunk_token_limit(
         chunks, max_tokens=settings.embedding_chunk_max_tokens
     )
@@ -167,7 +194,6 @@ async def _ingest_long_text(
         stable_chunk_id(parent_doc_id, index, chunk.content)
         for index, chunk in enumerate(chunks)
     ]
-    embedder = EmbeddingService()
     try:
         vectors = await embedder.embed_texts(contents)
         milvus.insert_vectors(
@@ -282,6 +308,7 @@ async def search_documents(
     if retriever is None or not retriever.connected:
         raise HTTPException(status_code=503, detail="混合检索依赖未连接，无法检索")
 
+    _require_embedding_configured()
     embedder = EmbeddingService()
     vector = await embedder.embed_text(q)
     try:

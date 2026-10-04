@@ -266,6 +266,37 @@ def _pdf_sections(text: str) -> list[tuple[str, dict[str, Any]]]:
     return sections
 
 
+def _merge_pdf_paragraphs(
+    sections: list[tuple[str, dict[str, Any]]], *, max_chars: int
+) -> list[tuple[str, dict[str, Any]]]:
+    """Keep page and table boundaries while grouping short PDF text blocks."""
+
+    merged: list[tuple[str, dict[str, Any]]] = []
+    pending: list[str] = []
+    pending_metadata: dict[str, Any] = {}
+
+    def flush() -> None:
+        if pending:
+            merged.append(("\n\n".join(pending), pending_metadata))
+            pending.clear()
+
+    for content, metadata in sections:
+        block_types = set(metadata.get("block_types") or [])
+        if block_types & {"table", "image_ocr"}:
+            flush()
+            merged.append((content, metadata))
+            continue
+        same_page = pending and pending_metadata.get("page_number") == metadata.get("page_number")
+        candidate_size = len("\n\n".join(pending)) + len(content) + 2
+        if pending and (not same_page or candidate_size > max_chars):
+            flush()
+        if not pending:
+            pending_metadata = metadata
+        pending.append(content)
+    flush()
+    return merged
+
+
 def _apply_overlap(chunks: list[DocumentChunk], *, ratio: float) -> list[DocumentChunk]:
     if ratio <= 0 or len(chunks) <= 1:
         return chunks
@@ -328,7 +359,7 @@ def chunk_document(
     if suffix == ".md":
         sections = _markdown_sections(normalized)
     elif suffix == ".pdf":
-        sections = _pdf_sections(normalized)
+        sections = _merge_pdf_paragraphs(_pdf_sections(normalized), max_chars=max_chars)
         page_details = {
             int(item["page_number"]): item
             for item in common.get("pages", [])

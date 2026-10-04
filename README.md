@@ -5,8 +5,8 @@
 ## 功能概览
 
 - **对话与工具调用**：LangGraph 工作流编排 + 单个旅行 ReAct Agent，内置「行程草稿」「差标校验」工具。
-- **健康检查**：探测 Redis、PostgreSQL、Milvus 可用性，返回 `ok` / `degraded`。
-- **文档入库与检索**：文本嵌入（OpenAI Embeddings）写入 Milvus，支持相似度检索。
+- **健康检查**：探测 Redis、PostgreSQL、Milvus、关键词索引和模型密钥配置，返回 `ok` / `degraded`。
+- **文档入库与检索**：文本嵌入写入 Milvus 和 Redis 关键词索引，支持混合检索。
 
 ## 架构说明
 
@@ -31,45 +31,53 @@
 ## 环境要求
 
 - Python 3.11+
-- PostgreSQL（异步 URL）、Redis、Milvus 2.x（可选；未启动时健康检查为 degraded，文档接口可能返回 503）
-- 兼容 OpenAI API 的密钥与 `base_url`（含国内兼容网关）
+- Docker Compose，或本机 PostgreSQL、Redis、Milvus 2.x
+- 宿主机运行时需安装 Node.js 18+，以使用仓库自带的 12306 查询脚本
+- 兼容 OpenAI API 的聊天模型密钥；知识库功能还需 Embeddings 密钥
 
 ## 安装与运行
 
-```bash
-cd project-python
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env        # 编辑 OPENAI_API_KEY 等
-```
-
-启动开发服务：
+在仓库根目录运行。首次部署先复制配置，再把大模型密钥填入 `.env`：
 
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+cp .env.example .env
+docker compose up --build -d
+docker compose ps
 ```
 
-如果你在宿主机直接运行 `uvicorn`，需要先启动本地依赖：
+**大模型配置位置：根目录 `.env`**。至少填写 `OPENAI_API_KEY`；若使用另一个 Embeddings 服务，还需填写 `EMBEDDING_API_KEY`、`EMBEDDING_BASE_URL`、`EMBEDDING_MODEL` 和对应的 `EMBEDDING_DIMENSIONS`。使用兼容网关时同步修改 `OPENAI_BASE_URL` 和 `OPENAI_MODEL`。修改后重启服务。未填密钥时服务可启动，但对话及知识库相关请求返回 503，健康状态为 `degraded`。
+
+航班和酒店默认使用明确标记的 Demo 数据；真实数据可设置 `TRAVEL_INVENTORY_PROVIDER=amadeus` 并填写 `AMADEUS_CLIENT_ID`/`AMADEUS_CLIENT_SECRET`，或设为 `flyai` 并填写 `FLYAI_API_KEY`。在 Docker 中使用 FlyAI 时还需设置 `INSTALL_FLYAI_CLI=1` 并重新构建。仓库自带的 12306 脚本默认用于火车票查询，无需额外 API Key，但需要网络连通。真实下单、付款和 OA/费控审批接口尚无供应商配置，当前只生成草稿与审批表。
+
+也可以在宿主机运行 Python，先启动依赖并安装项目包：
 
 ```bash
 docker compose up -d postgres redis etcd minio milvus-standalone
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-`Milvus` 首次启动会依赖 `etcd` 和 `minio` 完成初始化，通常需要几十秒；以 `docker compose ps` 中 `milvus-standalone` 变为 `healthy` 为准，再启动应用更稳妥。
+首次启动 Milvus 通常需要几十秒；以 `docker compose ps` 中 `milvus-standalone` 变为 `healthy` 为准。修改 `EMBEDDING_DIMENSIONS` 后，已有 Milvus 集合的向量维度不会自动迁移，需使用对应维度的新集合或重建现有知识库。
+
+默认依赖已覆盖 TXT、Markdown、HTML、PDF、DOCX、PPTX、XLSX 解析。扫描版 PDF 的 OCR 还需要本机安装 Tesseract 中文语言包；Docker 镜像已包含。Unstructured 增强解析是可选项；需要时设置 `.env` 中的 `INSTALL_OPTIONAL_DEPS=1` 后重新构建，或在宿主机执行 `pip install -r requirements-optional.txt`。检索先进行关键词＋向量召回和 RRF 融合；配置百炼文本排序 API 后，再调用远端模型重排候选文档。
+
+PDF 入库默认启用条款优先的 Embedding 语义切分（`RAG_SEMANTIC_PDF_ENABLED=true`）：短条款保持完整，长条款按相邻句向量的低相似度断点切分；表格另建完整表和带表头的逐行索引。可用 `RAG_SEMANTIC_MIN_CHARS`、`RAG_SEMANTIC_TARGET_CHARS`、`RAG_SEMANTIC_MAX_CHARS` 调整长度。修改切块配置或解析逻辑后，需删除旧文档并重新入库，评测题集也要按新 chunk ID 重新标注。
 
 - Swagger UI：<http://127.0.0.1:8000/docs>
 - ReDoc：<http://127.0.0.1:8000/redoc>
+- Web 控制台：<http://127.0.0.1:8000/app/>
 
 ## API 摘要
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/` | 服务名与文档链接 |
-| GET | `/api/v1/health` | 依赖健康状态 |
+| GET | `/api/v1/health` | 依赖和模型配置状态 |
 | POST | `/api/v1/chat` | 对话；`stream: true` 时返回 SSE |
-| POST | `/api/v1/documents/ingest` | 文档入库（需 Milvus） |
-| GET | `/api/v1/documents/search` | 向量检索 |
+| POST | `/api/v1/documents/ingest` | 文档入库（需 Embeddings、Milvus、Redis） |
+| GET | `/api/v1/documents/search` | 混合检索 |
 | POST | `/api/v1/mcp/rpc` | MCP JSON-RPC 工具与资源接口 |
 
 ### POST `/api/v1/chat`
@@ -104,27 +112,39 @@ docker compose up -d postgres redis etcd minio milvus-standalone
 
 - `plan_travel_itinerary`
 - `check_travel_policy`
+- `search_flights`
+- `search_hotels`
+- `search_trains`
+- `recommend_travel_options`
 
 ### GET `/api/v1/health`
 
-返回 `status`、`checks`（redis / database / milvus）、可选 `detail`。
+返回 `status`、`checks`（redis / database / milvus / keyword_index / chat_model_configured / embedding_model_configured；启用重排后另有 rerank_model_configured）、可选 `detail`。密钥检查只确认已配置，不会请求模型接口。
 
 ## 配置项
 
 见 `.env.example`。主要变量：`OPENAI_*`、`EMBEDDING_*`、`DATABASE_URL`、`REDIS_URL`、`MILVUS_*`、`LOG_LEVEL`。编排与模型相关阈值（窗口、摘要、熔断）在 `app/config.py` 中定义。
 
-聊天模型和向量模型可分开配置。例如使用 DeepSeek 聊天、OpenAI embeddings：
+聊天模型和向量模型可分开配置。例如使用 DeepSeek 对话、阿里云百炼文本嵌入：
 
 ```bash
-OPENAI_BASE_URL=https://api.deepseek.com
-OPENAI_MODEL=deepseek-chat
+OPENAI_BASE_URL=https://api.deepseek.com/v1
+OPENAI_MODEL=deepseek-v4-pro
 OPENAI_API_KEY=your_deepseek_key
+PLANNER_RESPONSE_FORMAT=json_object
 
-EMBEDDING_BASE_URL=https://api.openai.com/v1
-EMBEDDING_MODEL=text-embedding-3-small
-EMBEDDING_API_KEY=your_openai_key
+EMBEDDING_BASE_URL=https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+EMBEDDING_MODEL=qwen3.7-text-embedding
+EMBEDDING_API_KEY=your_bailian_key
 EMBEDDING_DIMENSIONS=1536
+
+RAG_RERANKER_ENABLED=true
+RAG_RERANKER_URL=https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+RAG_RERANKER_MODEL=qwen3.7-text-rerank
+RAG_RERANKER_API_KEY=your_bailian_key
 ```
+
+DeepSeek 的 Chat Completions 接口不支持本项目规划器默认使用的 `json_schema` 响应格式；接入 DeepSeek 时需设置 `PLANNER_RESPONSE_FORMAT=json_object`。重排使用百炼原生 API 的专用地址，不能填 `/compatible-mode/v1`；`RAG_RERANKER_API_KEY` 留空时会回退到 RRF 排序，健康检查显示未配置。修改 `.env` 后重启应用。示例中的 `{WorkspaceId}` 应替换为百炼控制台提供的业务空间 ID。
 
 ### LangGraph 工作流模式
 
@@ -185,6 +205,8 @@ pytest
 ```
 
 （可在 `tests/` 下补充用例。）
+
+真实差旅制度的 RAG 量化试点、证据标注、检索指标与人工答案复核流程见 [评测说明](evals/README.md)。
 
 ## 许可证
 

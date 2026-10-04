@@ -159,8 +159,9 @@ def _llm_cases(
             "role": "system",
             "content": (
                 "你是 RAG 评测集构造助手。请基于给定知识库 chunk 生成评测问题。"
-                "只输出 JSON 数组，每个元素包含 question, expected_answer, keywords。"
+                "只输出 JSON 数组，每个元素包含 question, expected_answer, evidence_quote, keywords。"
                 "要求：问题必须能被该 chunk 直接回答；不要引入 chunk 外的信息；"
+                "evidence_quote 必须逐字复制支持答案的原文片段；"
                 "keywords 选择 3-8 个用于答案校验的关键词。"
             ),
         },
@@ -207,6 +208,11 @@ def _normalize_generated_case(item: dict[str, Any], doc: dict[str, Any], index: 
         "expected_doc_ids": [doc_id],
         "keywords": normalized_keywords[:8],
         "expected_answer": str(item.get("expected_answer") or "").strip(),
+        "evidence_quote": str(item.get("evidence_quote") or "").strip(),
+        "evidence_quote_valid": bool(
+            str(item.get("evidence_quote") or "").strip()
+            and str(item.get("evidence_quote") or "").strip() in content
+        ),
         "source_title": str(doc.get("title") or ""),
         "source_doc_type": str(doc.get("doc_type") or ""),
         "source_content_preview": content[:500],
@@ -272,6 +278,8 @@ def write_review_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "relevant_ids",
         "keywords",
         "expected_answer",
+        "evidence_quote",
+        "evidence_quote_valid",
         "source_title",
         "source_doc_type",
         "source_content_preview",
@@ -291,6 +299,8 @@ def write_review_csv(path: Path, rows: list[dict[str, Any]]) -> None:
                     "relevant_ids": json.dumps(row["relevant_ids"], ensure_ascii=False),
                     "keywords": json.dumps(row["keywords"], ensure_ascii=False),
                     "expected_answer": row.get("expected_answer", ""),
+                    "evidence_quote": row.get("evidence_quote", ""),
+                    "evidence_quote_valid": row.get("evidence_quote_valid", False),
                     "source_title": row.get("source_title", ""),
                     "source_doc_type": row.get("source_doc_type", ""),
                     "source_content_preview": row.get("source_content_preview", ""),
