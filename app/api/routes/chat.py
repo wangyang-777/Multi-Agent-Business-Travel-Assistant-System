@@ -764,4 +764,6 @@ async def chat(
         verification=metadata.get("verification"),
         claim_evidence_map=metadata.get("claim_evidence_map") or [],
         rag_correction_count=int(metadata.get("rag_correction_count") or 0),
+        rag_evidence=metadata.get("rag_evidence"),
+        rag_stages=metadata.get("rag_stages") or [],
     )

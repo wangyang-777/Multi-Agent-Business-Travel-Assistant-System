@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     rag_rrf_k: int = 60
     rag_fused_top_k: int = 20
     rag_final_top_k: int = 5
+    rag_evidence_timeout_seconds: float = Field(default=120.0, gt=0, le=180)
+    rag_evidence_task_timeout_seconds: float = Field(default=360.0, gt=0, le=900)
+    rag_evidence_max_supplemental_queries: int = Field(default=1, ge=0, le=2)
+    rag_evidence_chunk_max_chars: int = Field(default=8000, ge=1000, le=20000)
     rag_semantic_pdf_enabled: bool = True
     rag_semantic_min_chars: int = Field(default=100, ge=1)
     rag_semantic_target_chars: int = Field(default=180, ge=1)

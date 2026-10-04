@@ -306,3 +306,23 @@ async def test_partial_invalid_dependency_graph_raises_instead_of_spinning():
             max_concurrency=2,
             timeout_seconds=1,
         )
+
+
+async def test_task_specific_timeout_preserves_other_task_result():
+    timeouts_seen = []
+
+    def timeout_for(item):
+        timeouts_seen.append(item["id"])
+        return 0.01 if item["id"] == "slow" else 1.0
+
+    async def runner(item, dependencies):
+        if item["id"] == "slow":
+            await asyncio.Event().wait()
+        return result(item["id"])
+
+    results = await execute_task_plan(
+        [task("slow"), task("fast", "search_flight")], runner,
+        max_concurrency=2, timeout_seconds=timeout_for,
+    )
+    assert set(timeouts_seen) == {"slow", "fast"}
+    assert [item["status"] for item in results] == ["failed", "completed"]

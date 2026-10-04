@@ -95,7 +95,7 @@ PDF 入库默认启用条款优先的 Embedding 语义切分（`RAG_SEMANTIC_PDF
 ```
 
 - `stream: false`：返回 JSON，结构与 OpenAI Chat Completions 类似（`choices[0].message.content`）。
-- 响应同时包含结构化增强字段：`tables`（表格化行程/差标）、`citations`（RAG 引用）、`approval_form`（人工审批单）、`trace`（工作流节点执行轨迹）、`risk_level`（风险等级）。
+- 响应同时包含结构化增强字段：`tables`（表格化行程/差标）、`citations`（RAG 引用）、`approval_form`（人工审批单）、`trace`（工作流节点执行轨迹）、`risk_level`（风险等级）。制度问答另含 `rag_evidence`（问题要求、用户事实、制度事实及计算结果）、`rag_stages`（各阶段输出）和 `verification`（逐条结论核验）。多任务响应中，这些问答字段保存在各自的 `task_results` 内。
 - `stream: true`：`text/event-stream`，每行 `data: {JSON}`，含 `StreamChunk`（`content` / `done` / `error`）。
 
 ### POST `/api/v1/mcp/rpc`
@@ -174,6 +174,13 @@ intent_router
   │    ↓
   ├─ rag_responder
   │    ↓
+  │  rag_evidence_builder（缺失制度依据时，可补充检索）
+  │    ↓
+  │  rag_answer_generator
+  │    ↓
+  │  grounding_verifier
+  │    ├─ 首次未通过 ──> rag_self_corrector ──> grounding_verifier
+  │    ↓ 通过 / 校正耗尽后保留已支持结论
   └─ general_responder
        ↓
 response_finalizer
@@ -182,8 +189,8 @@ response_finalizer
 本项目将“Agent”限定为能够自主选择工具、读取工具 observation 并在循环中决定下一步的组件。因此当前在线主链路只有 `travel_react_agent` 属于 Agent；LangGraph 中其他可执行单元统一称为节点。
 
 - **Agent**：`travel_react_agent` 使用 OpenAI function calling 自主选择旅行工具，并在最多 N 轮 ReAct 循环中根据工具结果继续行动或结束。
-- **LLM 节点**：`planner`、`policy_reasoner`、`rag_responder`、`general_responder`、`response_reviewer` 各执行一次有边界的模型任务，不自行调度其他节点。
-- **规则节点**：`input_guardrail`、`intent_router`、`policy_validator`、`travel_retry_router`、`approval_processor`、`grounding_verifier` 执行确定性检查、路由或结构化数据处理。
+- **LLM 节点**：`planner`、`policy_reasoner`、`rag_evidence_builder`、`rag_answer_generator`、`rag_self_corrector`、`general_responder`、`response_reviewer` 执行有边界的模型任务。`grounding_verifier` 联合模型语义核验与程序数值校验。
+- **规则节点**：`input_guardrail`、`intent_router`、`rag_responder`、`policy_validator`、`travel_retry_router`、`approval_processor` 执行检查、检索、路由或结构化数据处理。
 - **上下文与基础设施节点**：`context_builder`、`memory_fusion`、`response_finalizer` 负责会话装配、记忆融合、持久化和响应组装。
 
 可通过环境变量切回旧编排器：
@@ -197,6 +204,23 @@ AGENT_ORCHESTRATOR_BACKEND=legacy
 ```bash
 TRAVEL_VALIDATION_MAX_RETRIES=1
 ```
+
+### 证据驱动的制度问答
+
+保留关键词和向量召回、RRF、远端 rerank 及 `RAG_FINAL_TOP_K`。取得候选片段后，模型按当前任务整理需要的证据，分开记录用户提供的条件、制度原文和计算。程序检查引文确实来自对应片段、用户条件来自原始问题，使用受限 AST 和 Decimal 计算；公式中的费率和边界必须引用数值事实，不能写成无来源常量。
+
+草稿由带事实 ID 的独立结论组成，程序根据来源生成引用编号。核验模型检查对象、版本、表格列、例外、单位和多来源推导，程序再次检查金额与计算结果。首次核验失败时只校正失败结论，保留原问题及已通过的结论；校正后重新核验。核验不可用或再次失败时仅输出已有核验支持的部分，并说明信息不足，没有已支持结论则拒答。资料中的指令只作为数据处理。
+
+各模型步骤复用 `.env` 中的 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`，无需新增密钥；服务商需支持 JSON 对象输出。默认每次模型请求最多 120 秒，结构错误和引文错误分别最多修复一次，答案最多校正一次。多任务下每个制度问答任务总超时默认 360 秒，独立查询仍使用 `TASK_TIMEOUT_SECONDS`。整理结果提出缺失制度证据时默认最多补充一次检索；用户未提供的条件、片段明确未载明的信息仍需说明不足。
+
+```bash
+RAG_EVIDENCE_TIMEOUT_SECONDS=120
+RAG_EVIDENCE_TASK_TIMEOUT_SECONDS=360
+RAG_EVIDENCE_MAX_SUPPLEMENTAL_QUERIES=1
+RAG_EVIDENCE_CHUNK_MAX_CHARS=8000
+```
+
+`verification.passed=true` 表示输出的结论通过当前核验，`question_answered=true` 表示所有所问内容得到回答，两者需分别观察。正确的资料不足说明可通过核验而仍未回答问题；多任务下此类结果为 `needs_review`，不能作为已完成的前置任务。非 RAG 回复的核验为 `status=skipped, passed=null`。模型语义核验仍可能出错，业务正确率需要按评测集人工复核；额外模型步骤也会增加延迟和 token 成本。
 
 ## 测试
 

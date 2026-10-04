@@ -104,6 +104,8 @@ class TaskResult(BaseModel):
     tool_trace: list[dict[str, Any]] = Field(default_factory=list)
     verification: dict[str, Any] | None = None
     claim_evidence_map: list[dict[str, Any]] = Field(default_factory=list)
+    rag_evidence: dict[str, Any] | None = None
+    rag_stages: list[dict[str, Any]] = Field(default_factory=list)
     booking_draft: BookingDraft | None = None
     approval_form: ApprovalForm | None = None
     policy_constraints: dict[str, Any] | None = None
@@ -138,6 +140,8 @@ class ChatResponse(BaseModel):
     verification: Optional[dict[str, Any]] = None
     claim_evidence_map: list[dict[str, Any]] = Field(default_factory=list)
     rag_correction_count: int = 0
+    rag_evidence: dict[str, Any] | None = None
+    rag_stages: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class StreamChunkType(str, Enum):

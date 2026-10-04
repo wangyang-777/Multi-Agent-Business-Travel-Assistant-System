@@ -201,6 +201,7 @@ def evaluate(
     *,
     top_ks: list[int],
     include_chat: bool,
+    chat_timeout_s: float = 360.0,
 ) -> dict[str, Any]:
     if not cases:
         raise ValueError("No evaluation cases were provided")
@@ -244,6 +245,7 @@ def evaluate(
                 ))
 
         if include_chat:
+            chat_started = time.perf_counter()
             chat = _request_json(
                 "POST",
                 f"{base_url}/api/v1/chat",
@@ -252,7 +254,7 @@ def evaluate(
                     "stream": False,
                     "session_id": f"rag-eval-{case.case_id}-{int(time.time())}",
                 },
-                timeout_s=90.0,
+                timeout_s=chat_timeout_s,
             )
             answer = _answer_text(chat)
             row["keyword_ok"] = bool(case.keywords) and all(
@@ -268,6 +270,11 @@ def evaluate(
             ]
             verification = chat.get("verification")
             row["verification"] = verification if isinstance(verification, dict) else None
+            row["rag_evidence"] = chat.get("rag_evidence")
+            row["rag_stages"] = chat.get("rag_stages") or []
+            row["task_results"] = chat.get("task_results") or []
+            row["chat_latency_ms"] = round((time.perf_counter() - chat_started) * 1000, 2)
+            row["usage"] = chat.get("usage")
             row["verification_passed"] = (
                 verification.get("passed") if isinstance(verification, dict) else None
             )
@@ -310,7 +317,10 @@ def main() -> int:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--top-ks", default="", help="Comma-separated K values, e.g. 1,3,5")
     parser.add_argument("--skip-chat", action="store_true", help="Only evaluate retrieval metrics")
+    parser.add_argument("--chat-timeout", type=float, default=360.0, help="Chat request timeout in seconds")
     args = parser.parse_args()
+    if args.chat_timeout <= 0:
+        parser.error("--chat-timeout must be positive")
 
     cases = load_cases(Path(args.cases))
     top_ks = _parse_top_ks(args.top_ks, args.top_k)
@@ -369,6 +379,7 @@ def main() -> int:
             cases,
             top_ks=top_ks,
             include_chat=not args.skip_chat,
+            chat_timeout_s=args.chat_timeout,
         )
     except Exception as exc:  # noqa: BLE001 - eval should report failures plainly
         print(

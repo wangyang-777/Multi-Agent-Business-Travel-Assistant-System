@@ -148,3 +148,30 @@ def test_apply_rag_review_does_not_approve_blank_decision(tmp_path) -> None:
     review_path.write_text("id,reviewer_decision\nunreviewed,\n", encoding="utf-8")
 
     assert apply_review(cases_path=cases_path, review_csv_path=review_path) == []
+
+
+def test_eval_preserves_stage_data_and_configurable_chat_timeout(monkeypatch):
+    from evals import run_rag_eval
+
+    timeouts = []
+    evidence = {"facts": {"p_rate": {"value": "135", "chunk_ids": ["policy"]}}}
+    stages = [{"stage": "final", "answer": "405元[1]"}]
+
+    def request(method, url, *, payload=None, timeout_s=30.0):
+        if method == "GET":
+            return {"results": [{"chunk_id": "policy"}]}
+        timeouts.append(timeout_s)
+        return {"choices": [{"message": {"content": "405元[1]"}}],
+                "citations": [{"chunk_id": "policy"}], "rag_evidence": evidence,
+                "rag_stages": stages, "verification": {"passed": True, "question_answered": True},
+                "usage": {"total_tokens": 99}}
+
+    monkeypatch.setattr(run_rag_eval, "_request_json", request)
+    report = run_rag_eval.evaluate(
+        "http://localhost", [run_rag_eval.RagCase("a", "3天补助？", ["policy"], ["405"])],
+        top_ks=[1], include_chat=True, chat_timeout_s=420,
+    )
+    assert timeouts == [420]
+    assert report["cases"][0]["rag_evidence"] == evidence
+    assert report["cases"][0]["rag_stages"] == stages
+    assert report["cases"][0]["usage"]["total_tokens"] == 99
