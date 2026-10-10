@@ -419,37 +419,32 @@ def test_heuristic_policy_constraints_extracts_common_rules() -> None:
     assert result["constraints"]["cabin_limit"] == "economy"
 
 
-def test_reliable_citation_detection() -> None:
-    assert LangGraphTravelOrchestrator._has_reliable_citations(
-        "staff 去上海酒店标准是多少？",
-        [{"title": "policy-hotel-tier1", "content": "staff 员工去上海酒店标准为 800 CNY"}],
-    )
-    assert not LangGraphTravelOrchestrator._has_reliable_citations(
-        "高级员工去济南高铁标准是什么？",
-        [{"title": "policy-hotel-tier1", "content": "staff 员工去上海酒店标准为 800 CNY"}],
-    )
+@pytest.mark.asyncio
+async def test_retrieved_table_proceeds_without_keyword_gate(monkeypatch) -> None:
+    orch = LangGraphTravelOrchestrator(llm=_FakeLLM(), document_store=_FakeStore([
+        {"id": "row", "content": "| 级别 | 飞机 |\n| A级 | 公务舱 |"}
+    ]))
+    monkeypatch.setattr("app.agent.langgraph_orchestrator.EmbeddingService", _FakeEmbedder)
+    state = {"messages": [ChatMessage(role=MessageRole.USER, content="A级飞机舱位标准是什么？")], "trace": []}
+    result = await orch._rag_responder(state)
+    assert result.goto == "rag_evidence_builder"
+    assert result.update["citations"][0]["chunk_id"] == "row"
 
 
-def test_verification_flags_unsupported_rag_terms() -> None:
-    result = LangGraphTravelOrchestrator._verify_answer_grounding(
-        "staff 去上海酒店标准为 900 CNY，需要审批。",
-        [{"title": "policy-hotel-tier1", "content": "staff 去上海酒店标准为 800 CNY。"}],
-        "rag_grounded",
-    )
-
-    assert result["passed"] is False
-    assert "900 CNY" in result["unsupported_terms"]
+@pytest.mark.asyncio
+async def test_missing_evidence_state_cannot_pass_rag_verification() -> None:
+    orch = LangGraphTravelOrchestrator(llm=_FakeLLM())
+    result = await orch._grounding_verifier({"answer": "金额900元", "answer_mode": "rag_grounded"})
+    assert result.goto == "response_finalizer"
+    assert result.update["verification"]["passed"] is False
 
 
-def test_verification_skips_llm_fallback() -> None:
-    result = LangGraphTravelOrchestrator._verify_answer_grounding(
-        "未检索到公司制度依据，以下为通用建议。",
-        [],
-        "llm_fallback",
-    )
-
-    assert result["passed"] is True
-    assert result["reason"] == "non_rag_answer"
+@pytest.mark.asyncio
+async def test_non_rag_verification_is_explicitly_skipped() -> None:
+    orch = LangGraphTravelOrchestrator(llm=_FakeLLM())
+    result = await orch._grounding_verifier({"answer": "你好", "answer_mode": None})
+    assert result.update["verification"]["passed"] is None
+    assert result.update["verification"]["status"] == "skipped"
 
 
 @pytest.mark.asyncio

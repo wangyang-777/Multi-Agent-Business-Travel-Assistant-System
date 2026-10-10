@@ -456,6 +456,8 @@ async def test_chat_exposes_task_results_and_routing_metadata(
                             "answer": "按制度报销[policy_1]",
                             "citations": [{"chunk_id": "policy_1", "content": "报销制度"}],
                             "verification": {"grounded": True},
+                            "rag_evidence": {"facts": {"p_rule": {"chunk_ids": ["policy_1"]}}},
+                            "rag_stages": [{"stage": "final", "answer": "按制度报销"}],
                             "claim_evidence_map": [
                                 {"claim": "按制度报销", "chunk_ids": ["policy_1"]}
                             ],
@@ -477,6 +479,8 @@ async def test_chat_exposes_task_results_and_routing_metadata(
     assert [item["task_id"] for item in payload["task_results"]] == ["task_1", "task_2"]
     assert payload["task_results"][1]["citations"][0]["chunk_id"] == "policy_1"
     assert payload["task_results"][1]["verification"] == {"grounded": True}
+    assert payload["task_results"][1]["rag_evidence"]["facts"]["p_rule"]["chunk_ids"] == ["policy_1"]
+    assert payload["task_results"][1]["rag_stages"][0]["stage"] == "final"
     assert payload["task_results"][0]["usage"] == {"total_tokens": 10}
     assert payload["booking_draft"] is None
     assert payload["approval_form"] is None

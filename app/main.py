@@ -17,6 +17,7 @@ from app.agent.orchestrator import TravelOrchestrator
 from app.api.routes import chat as chat_routes
 from app.api.routes import documents as documents_routes
 from app.api.routes import health as health_routes
+from app.api.routes import human_reviews as human_review_routes
 from app.api.routes import mcp as mcp_routes
 from app.api.routes import sessions as sessions_routes
 from app.config import settings
@@ -137,6 +138,7 @@ def create_app() -> FastAPI:
     app.include_router(documents_routes.router, prefix="/api/v1")
     app.include_router(mcp_routes.router, prefix="/api/v1")
     app.include_router(sessions_routes.router, prefix="/api/v1")
+    app.include_router(human_review_routes.router, prefix="/api/v1")
     static_dir = Path(__file__).resolve().parent / "static"
     if static_dir.exists():
         app.mount("/app", StaticFiles(directory=str(static_dir), html=True), name="console")

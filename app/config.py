@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     rag_rrf_k: int = 60
     rag_fused_top_k: int = 20
     rag_final_top_k: int = 5
+    rag_evidence_timeout_seconds: float = Field(default=120.0, gt=0, le=180)
+    rag_evidence_task_timeout_seconds: float = Field(default=360.0, gt=0, le=900)
+    rag_evidence_max_supplemental_queries: int = Field(default=1, ge=0, le=2)
+    rag_evidence_chunk_max_chars: int = Field(default=8000, ge=1000, le=20000)
     rag_semantic_pdf_enabled: bool = True
     rag_semantic_min_chars: int = Field(default=100, ge=1)
     rag_semantic_target_chars: int = Field(default=180, ge=1)
@@ -66,6 +70,11 @@ class Settings(BaseSettings):
     memory_summary_threshold: int = 15
     memory_max_messages: int = 40
     memory_session_ttl_seconds: int = 86400
+
+    # Shared operator credential for the internal review console; never sent to chat clients.
+    human_review_api_token: str = ""
+    human_review_reviewer_name: str = "制度审核员"
+    human_review_ttl_seconds: int = Field(default=2592000, ge=86400)
 
     # Circuit breaker config
     circuit_breaker_failure_threshold: int = 5

@@ -34,7 +34,7 @@ async def execute_task_plan(
     runner: TaskRunner,
     *,
     max_concurrency: int,
-    timeout_seconds: float,
+    timeout_seconds: float | Callable[[Task], float],
 ) -> list[TaskResult]:
     """Run only ready tasks; failed/unverified prerequisites block their descendants.
 
@@ -48,7 +48,8 @@ async def execute_task_plan(
     async def execute(task: Task) -> TaskResult:
         dependencies = [results[task_id] for task_id in task["depends_on"]]
         try:
-            return await asyncio.wait_for(runner(task, dependencies), timeout=timeout_seconds)
+            timeout = timeout_seconds(task) if callable(timeout_seconds) else timeout_seconds
+            return await asyncio.wait_for(runner(task, dependencies), timeout=timeout)
         except TimeoutError:
             return unsuccessful_task(task, "failed", "该任务执行超时，请稍后重试。")
         except Exception:  # Each task failure is isolated; cancellation still propagates.

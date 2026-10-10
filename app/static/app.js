@@ -8,6 +8,9 @@ const state = {
   sessions: [],
   selectedSession: null,
   health: null,
+  reviewToken: "",
+  activeReview: null,
+  sessionReviews: [],
 };
 
 const evalCases = [
@@ -50,13 +53,15 @@ function escapeHtml(value) {
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
   });
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
   if (!response.ok) {
-    throw new Error(data.detail || `HTTP ${response.status}`);
+    const error = new Error(data.detail || `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
   return data;
 }
@@ -66,7 +71,9 @@ async function apiForm(path, formData) {
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
   if (!response.ok) {
-    throw new Error(data.detail || `HTTP ${response.status}`);
+    const error = new Error(data.detail || `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
   return data;
 }
@@ -80,6 +87,7 @@ function setView(view) {
     history: ["History", "按 session_id 查看、恢复与管理历史对话"],
     knowledge: ["Knowledge", "政策文档入库、查看与删除"],
     eval: ["RAG 评测", "检索命中、回答关键词与引用准确率"],
+    reviews: ["人工审核", "核对制度依据，确认条件并发布审核结论"],
     system: ["System", "运行依赖与服务健康状态"],
   };
   $("#view-title").textContent = titles[view][0];
@@ -132,6 +140,15 @@ function renderMessages() {
 }
 
 function renderResponseDetails(response) {
+  if (response?.human_reviews?.length) {
+    const storageKey = `travelAgentReviews:${state.sessionId}`;
+    let saved = [];
+    try { saved = JSON.parse(localStorage.getItem(storageKey) || "[]"); } catch { saved = []; }
+    const refs = new Map(saved.map((item) => [item.review_id, item]));
+    for (const item of response.human_reviews) if (item.review_id && item.result_token) refs.set(item.review_id, { review_id: item.review_id, result_token: item.result_token });
+    localStorage.setItem(storageKey, JSON.stringify([...refs.values()].slice(-100)));
+  }
+  renderHumanReviewSummaries(response?.human_reviews || state.sessionReviews || []);
   renderTables(response?.tables || []);
   renderApproval(response?.approval_form || null, response?.risk_level || null, response?.booking_draft || null);
   renderCitations(response?.citations || [], response?.answer_mode || null);
@@ -281,6 +298,7 @@ async function sendChat(event) {
 }
 
 async function loadCurrentSession() {
+  state.sessionReviews = [];
   const sessionId = $("#session-id").value.trim();
   if (!sessionId) {
     await loadSessionOptions();
@@ -300,6 +318,27 @@ async function loadCurrentSession() {
     state.lastResponse = null;
   }
   renderMessages();
+  refreshSessionReviews();
+}
+
+async function refreshSessionReviews() {
+  try {
+    const refs = JSON.parse(localStorage.getItem(`travelAgentReviews:${state.sessionId}`) || "[]");
+    const reviews = await Promise.all(refs.map(async (ref) => {
+      try {
+        const result = await api(`/api/v1/human-reviews/${encodeURIComponent(ref.review_id)}/result?session_id=${encodeURIComponent(state.sessionId)}`, { headers: { "X-Review-Result-Token": ref.result_token } });
+        return { ...result, result_token: ref.result_token };
+      } catch (error) {
+        if (error.status === 404) return { ...ref, status: "expired", reasons: [{ detail: "审核单已过期或回执凭据无效，请联系审核人员。" }] };
+        throw error;
+      }
+    }));
+    state.sessionReviews = reviews;
+    if (state.lastResponse) state.lastResponse.human_reviews = state.sessionReviews;
+    renderHumanReviewSummaries(state.sessionReviews);
+  } catch (error) {
+    $("#tab-review").textContent = `查询审核结果失败：${error.message}`;
+  }
 }
 
 function undoLastTurn() {
@@ -599,6 +638,18 @@ function bindEvents() {
     const id = event.target?.dataset?.deleteDoc;
     if (id) deleteDocument(id);
   });
+  $("#review-login").addEventListener("submit", (event) => {
+    event.preventDefault();
+    state.reviewToken = $("#review-token").value.trim();
+    loadReviewQueue();
+  });
+  $("#review-list").addEventListener("click", (event) => {
+    const item = event.target.closest("[data-review-id]");
+    if (item) loadReviewDetail(item.dataset.reviewId);
+  });
+  $("#tab-review").addEventListener("click", (event) => {
+    if (event.target.closest("[data-refresh-reviews]")) refreshSessionReviews();
+  });
   $("#run-eval").addEventListener("click", runEval);
   $("#refresh-health").addEventListener("click", loadHealth);
 }
@@ -608,3 +659,84 @@ syncSessionInput();
 renderMessages();
 loadHealth();
 loadSessionOptions();
+
+function reviewStatus(status) {
+  return { pending: "待人工审核", approved: "审核通过", rejected: "审核未通过", needs_information: "需补充信息", submission_failed: "审核单提交失败", expired: "审核回执不可用" }[status] || status;
+}
+
+function renderHumanReviewSummaries(reviews) {
+  const target = $("#tab-review");
+  target.innerHTML = '<button class="ghost" data-refresh-reviews>刷新当前会话审核结果</button>';
+  if (!reviews.length) {
+    target.innerHTML += '<div class="empty">本次没有待人工审核的问题。</div>';
+    return;
+  }
+  target.innerHTML += reviews.map((review) => `<div class="citation">
+    <div class="item-title">${escapeHtml(reviewStatus(review.status))}</div>
+    <div>${escapeHtml(review.question || "")}</div>
+    <ul>${(review.reasons || []).map((reason) => `<li>${escapeHtml(reason.detail)}</li>`).join("")}</ul>
+    ${review.status === "approved" ? `<div class="message assistant">${escapeHtml(review.final_answer || "")}</div>` : ""}
+    ${review.notes ? `<p>审核说明：${escapeHtml(review.notes)}</p>` : ""}
+    ${review.reviewer ? `<p>审核人：${escapeHtml(review.reviewer)} · ${escapeHtml(review.reviewed_at)}</p>` : ""}
+    ${review.status === "needs_information" ? '<p>请补充上述信息后重新提问。</p>' : ""}
+    ${review.review_id ? `<small>审核单：${escapeHtml(review.review_id)}</small>` : ""}
+  </div>`).join("");
+}
+
+async function reviewApi(path, options = {}) {
+  return api(path, { ...options, headers: { ...(options.headers || {}), Authorization: `Bearer ${state.reviewToken}` } });
+}
+
+async function loadReviewQueue() {
+  const target = $("#review-list");
+  try {
+    const data = await reviewApi("/api/v1/human-reviews");
+    $("#review-actor").textContent = `当前审核身份：${data.reviewer}`;
+    target.innerHTML = data.reviews.length ? data.reviews.map((ticket) => `<button class="doc-item" data-review-id="${escapeHtml(ticket.review_id)}">${escapeHtml(ticket.task_request || ticket.question)}<br><small>${escapeHtml(ticket.created_at)}</small></button>`).join("") : '<div class="empty">暂无待审核问题。</div>';
+  } catch (error) {
+    target.textContent = `加载失败：${error.message}`;
+  }
+}
+
+async function loadReviewDetail(id) {
+  const target = $("#review-detail");
+  try {
+    const ticket = await reviewApi(`/api/v1/human-reviews/${encodeURIComponent(id)}`);
+    state.activeReview = ticket;
+    const snapshot = ticket.snapshot;
+    target.innerHTML = `<h3>${escapeHtml(reviewStatus(ticket.status))}</h3>
+      <p>原问题：${escapeHtml(snapshot.question)}</p><p>本次审核范围：${escapeHtml(snapshot.task_request)}</p>
+      <h4>待确认事项</h4><ul>${ticket.reasons.map((reason) => `<li>${escapeHtml(reason.detail)}</li>`).join("")}</ul>
+      <h4>候选答复（尚未审核）</h4><div class="message assistant">${escapeHtml(snapshot.candidate_answer)}</div>
+      <h4>原文依据</h4>${snapshot.citations.map((citation, index) => `<div class="citation"><strong>[${index + 1}] ${escapeHtml(citation.title || "制度原文")}</strong><div class="message">${escapeHtml(citation.content)}</div></div>`).join("")}
+      <details><summary>事实、计算和核验记录</summary><pre>${escapeHtml(JSON.stringify({ evidence: snapshot.evidence, verification: snapshot.verification, stages: snapshot.stages }, null, 2))}</pre></details>
+      ${ticket.status === "pending" ? `<form class="stack-form" id="review-decision-form">
+        <label>审核决定<select id="review-action"><option value="approved">通过并发布答复</option><option value="needs_information">要求补充信息</option><option value="rejected">不通过</option></select></label>
+        <label>最终答复<textarea id="review-final-answer" rows="5" placeholder="通过审核时填写正式答复；未通过时留空"></textarea></label>
+        <label>审核理由或需补充的信息<textarea id="review-notes" rows="3" required></textarea></label>
+        <button class="primary" type="submit" id="review-submit">提交审核决定</button>
+      </form>` : `<div class="message assistant">${escapeHtml(ticket.decision?.final_answer || ticket.decision?.notes || "")}</div>`}`;
+    $("#review-decision-form")?.addEventListener("submit", submitReviewDecision);
+  } catch (error) {
+    target.textContent = `加载失败：${error.message}`;
+  }
+}
+
+async function submitReviewDecision(event) {
+  event.preventDefault();
+  const button = $("#review-submit");
+  button.disabled = true;
+  try {
+    const id = state.activeReview.review_id;
+    const result = await reviewApi(`/api/v1/human-reviews/${encodeURIComponent(id)}/decision`, {
+      method: "POST", body: JSON.stringify({ action: $("#review-action").value, final_answer: $("#review-final-answer").value, notes: $("#review-notes").value }),
+    });
+    $("#review-detail").textContent = `${reviewStatus(result.status)}。${result.final_answer || result.notes}`;
+    await loadReviewQueue();
+  } catch (error) {
+    button.disabled = false;
+    const notice = document.createElement("p");
+    notice.textContent = `提交失败：${error.message}`;
+    $("#review-decision-form").append(notice);
+  }
+}

@@ -95,7 +95,7 @@ PDF 入库默认启用条款优先的 Embedding 语义切分（`RAG_SEMANTIC_PDF
 ```
 
 - `stream: false`：返回 JSON，结构与 OpenAI Chat Completions 类似（`choices[0].message.content`）。
-- 响应同时包含结构化增强字段：`tables`（表格化行程/差标）、`citations`（RAG 引用）、`approval_form`（人工审批单）、`trace`（工作流节点执行轨迹）、`risk_level`（风险等级）。
+- 响应同时包含结构化增强字段：`tables`（表格化行程/差标）、`citations`（RAG 引用）、`approval_form`（人工审批单）、`trace`（工作流节点执行轨迹）、`risk_level`（风险等级）。制度问答另含 `rag_evidence`（问题要求、用户事实、制度事实及计算结果）、`rag_stages`（各阶段输出）和 `verification`（逐条结论核验）。多任务响应中，这些问答字段保存在各自的 `task_results` 内。
 - `stream: true`：`text/event-stream`，每行 `data: {JSON}`，含 `StreamChunk`（`content` / `done` / `error`）。
 
 ### POST `/api/v1/mcp/rpc`
@@ -174,6 +174,13 @@ intent_router
   │    ↓
   ├─ rag_responder
   │    ↓
+  │  rag_evidence_builder（缺失制度依据时，可补充检索）
+  │    ↓
+  │  rag_answer_generator
+  │    ↓
+  │  grounding_verifier
+  │    ├─ 首次未通过 ──> rag_self_corrector ──> grounding_verifier
+  │    ↓ 通过 / 校正耗尽后保留已支持结论
   └─ general_responder
        ↓
 response_finalizer
@@ -182,8 +189,8 @@ response_finalizer
 本项目将“Agent”限定为能够自主选择工具、读取工具 observation 并在循环中决定下一步的组件。因此当前在线主链路只有 `travel_react_agent` 属于 Agent；LangGraph 中其他可执行单元统一称为节点。
 
 - **Agent**：`travel_react_agent` 使用 OpenAI function calling 自主选择旅行工具，并在最多 N 轮 ReAct 循环中根据工具结果继续行动或结束。
-- **LLM 节点**：`planner`、`policy_reasoner`、`rag_responder`、`general_responder`、`response_reviewer` 各执行一次有边界的模型任务，不自行调度其他节点。
-- **规则节点**：`input_guardrail`、`intent_router`、`policy_validator`、`travel_retry_router`、`approval_processor`、`grounding_verifier` 执行确定性检查、路由或结构化数据处理。
+- **LLM 节点**：`planner`、`policy_reasoner`、`rag_evidence_builder`、`rag_answer_generator`、`rag_self_corrector`、`general_responder`、`response_reviewer` 执行有边界的模型任务。`grounding_verifier` 联合模型语义核验与程序数值校验。
+- **规则节点**：`input_guardrail`、`intent_router`、`rag_responder`、`policy_validator`、`travel_retry_router`、`approval_processor` 执行检查、检索、路由或结构化数据处理。
 - **上下文与基础设施节点**：`context_builder`、`memory_fusion`、`response_finalizer` 负责会话装配、记忆融合、持久化和响应组装。
 
 可通过环境变量切回旧编排器：
@@ -198,6 +205,25 @@ AGENT_ORCHESTRATOR_BACKEND=legacy
 TRAVEL_VALIDATION_MAX_RETRIES=1
 ```
 
+### 证据驱动的制度问答
+
+保留关键词和向量召回、RRF、远端 rerank 及 `RAG_FINAL_TOP_K`。取得候选片段后，模型按当前任务整理需要的证据，分开记录用户提供的条件、制度原文和计算。程序检查引文确实来自对应片段、用户条件来自原始问题，使用受限 AST 和 Decimal 计算；公式中的费率和边界必须引用数值事实，不能写成无来源常量。
+
+草稿由带事实 ID 的独立结论组成，程序根据来源生成引用编号。核验模型检查对象、版本、表格列、例外、单位和多来源推导，程序再次检查金额与计算结果。首次核验失败时只校正失败结论，保留原问题及已通过的结论；校正后重新核验。核验不可用或再次失败时仅输出已有核验支持的部分，并说明信息不足，没有已支持结论则拒答。资料中的指令只作为数据处理。
+
+各模型步骤复用 `.env` 中的 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`，无需新增密钥；服务商需支持 JSON 对象输出。默认每次模型请求最多 120 秒。证据整理保留一次结构修复和一次来源/计算校验修复；草稿的 JSON 结构与业务校验错误共用一次修复机会，修复后仍进入语义核验。语义核验失败的答案最多校正一次；校正输出的结构与业务校验错误共用一次有界修复，修复后重新核验。仍不确定或处理失败时进入人工审核。多任务下每个制度问答任务总超时默认 360 秒，独立查询仍使用 `TASK_TIMEOUT_SECONDS`。整理结果提出缺失制度证据时默认最多补充一次检索；用户未提供的条件、片段明确未载明的信息仍需说明不足。
+
+直接读取标准、根据条件选择档位属于制度规则结论；边界比较可由程序计算布尔结果，合计或上浮后的新金额必须引用已校验的算术结果。`rag_stages` 在发生校验或修复时附带 `diagnostics` 和 `repair_count`，记录错误代码、字段、相关记录 ID 及修复开始/成功/失败事件。终止处理时，`verification.validation_error` 保留最后的程序校验原因。服务日志仅记录这些结构化诊断，不记录原始模型输出、引文或服务商异常正文。
+
+```bash
+RAG_EVIDENCE_TIMEOUT_SECONDS=120
+RAG_EVIDENCE_TASK_TIMEOUT_SECONDS=360
+RAG_EVIDENCE_MAX_SUPPLEMENTAL_QUERIES=1
+RAG_EVIDENCE_CHUNK_MAX_CHARS=8000
+```
+
+`verification.passed=true` 表示输出的结论通过当前核验，`question_answered=true` 表示所有所问内容得到回答，两者需分别观察。正确的资料不足说明可通过核验而仍未回答问题；多任务下此类结果为 `needs_review`，不能作为已完成的前置任务。非 RAG 回复的核验为 `status=skipped, passed=null`。模型语义核验仍可能出错，业务正确率需要按评测集人工复核；额外模型步骤也会增加延迟和 token 成本。
+
 ## 测试
 
 ```bash
@@ -211,3 +237,29 @@ pytest
 ## 许可证
 
 企业内部使用请以贵司合规要求为准。
+
+### 制度问答的人工审核
+
+当证据或适用条件缺失、规则冲突、语义核验要求人工解释，或自动校正/核验未能完成时，系统生成独立的制度问答审核单。此审核单与预订审批单分开处理：
+
+1. 用户答复显示“待人工审核”，候选资料明确标注为尚未人工审核，不作为最终结论。
+2. 审核单保存原问题、任务范围、候选答复、原始引用、事实及计算、核验和失败诊断。
+3. 审核人在 Console 左侧“人工审核”输入审核凭据，核对来源后选择通过、拒绝或要求补充信息。通过时必须明确填写正式答复及审核理由，模型不会改写审核决定。
+4. 用户在聊天右侧“人工审核”点击刷新结果；审核回执也写入原会话历史。要求补充信息后，用户补充并重新提问，形成新的审核单。审核不会自动恢复被阻断的预订等后续任务，需用户再次发起。
+
+配置在根目录 `.env`：`HUMAN_REVIEW_API_TOKEN` 是独立于模型API密钥的审核凭据，`HUMAN_REVIEW_REVIEWER_NAME` 是该凭据所代表的审核账号名称。只给审核人员提供此凭据；浏览器仅在当前页面内存中保存审核凭据，刷新页面需重新输入。修改配置后重启服务。
+
+这是当前内部控制台的单审核账号方式，并非企业SSO或多审核人账号系统。现有聊天/历史接口仍沿用项目的内部会话访问方式。用户查询审核回执还必须携带聊天响应返回的独立 `result_token`，不会仅凭可猜测的session_id读取审核结果；浏览器本地保存回执凭据用于刷新和恢复。换浏览器或清空本地存储后可由审核人员从审核单查询结果。队列存储不可用时明确返回 `submission_failed`，不会声称提交成功；不要删除Redis数据卷。审核单默认保留30天，过期后回执返回404，需要长期审计应调整保留期或对接企业档案系统。
+
+接口：
+
+- `GET /api/v1/human-reviews`：待审核列表，需要审核Bearer凭据。
+- `GET /api/v1/human-reviews/{review_id}`：完整审核材料，需要审核Bearer凭据。
+- `POST /api/v1/human-reviews/{review_id}/decision`：提交 `action`（`approved`、`rejected`、`needs_information`）、`final_answer` 和 `notes`，需要审核Bearer凭据；已处理单返回409，不覆盖决定。
+- `GET /api/v1/human-reviews/{review_id}/result?session_id=...`：用户回执，需要 `X-Review-Result-Token` 请求头。
+
+`/chat`返回 `answer_status`（`automatic`、`pending_human_review`、`review_submission_failed`）及 `human_reviews`。流式响应在 `done` 事件返回相同状态、session_id和审核单信息。`verification.passed`仍表示自动判断的结论支持性，不能替代 `answer_status` 和人工决定。
+
+初始草稿和语义校正各自将JSON结构及业务校验错误限制在一次修复机会内；语义校正结果修复后仍重新核验。业务歧义交人工解释，不放宽来源及引用约束。
+
+评测新增转人工率、审核单提交率；答案复核表增加 `review_appropriate_0_or_1`、`reviewed_outcome_correct_0_or_1`、`review_duration_seconds`。`score_sheet`的自动答案指标排除转人工案例，转人工是否合理及审核后结果只根据明确的复核标签评分，待审核不会自动记为答错或答对。自动答案正确率应与转人工率、处理覆盖率一起报告；旧评测结果不会被自动重评。
