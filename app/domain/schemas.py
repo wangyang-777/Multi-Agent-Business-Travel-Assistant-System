@@ -112,6 +112,7 @@ class TaskResult(BaseModel):
     policy_validation: dict[str, Any] | None = None
     risk_level: Literal["low", "medium", "high"] | None = None
     usage: dict[str, int] | None = None
+    human_review: dict[str, Any] | None = None
 
 
 class ChatResponse(BaseModel):
@@ -142,6 +143,8 @@ class ChatResponse(BaseModel):
     rag_correction_count: int = 0
     rag_evidence: dict[str, Any] | None = None
     rag_stages: list[dict[str, Any]] = Field(default_factory=list)
+    human_reviews: list[dict[str, Any]] = Field(default_factory=list)
+    answer_status: Literal["automatic", "pending_human_review", "review_submission_failed"] = "automatic"
 
 
 class StreamChunkType(str, Enum):
@@ -159,6 +162,9 @@ class StreamChunk(BaseModel):
     tool_args: Optional[dict[str, Any]] = None
     finish_reason: Optional[str] = None
     error: Optional[str] = None
+    session_id: str | None = None
+    human_reviews: list[dict[str, Any]] | None = None
+    answer_status: str | None = None
 
 
 class DocumentIngestRequest(BaseModel):

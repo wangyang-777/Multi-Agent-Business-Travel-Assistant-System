@@ -13,6 +13,8 @@ FIELDS = [
     "id", "case_type", "answerable", "question", "expected_answer", "answer_text",
     "relevant_ids", "retrieved_ids", "citation_ids", "answer_correct_0_or_1",
     "grounded_0_or_1", "citation_correct_0_or_1", "abstained_0_or_1", "notes",
+    "human_review_required", "review_submitted", "review_appropriate_0_or_1",
+    "reviewed_outcome_correct_0_or_1", "review_duration_seconds",
 ]
 
 
@@ -64,16 +66,29 @@ def score_sheet(path: Path) -> dict[str, Any]:
         "negative_abstention_rate": (False, "abstained_0_or_1"),
     }
     output: dict[str, Any] = {"case_count": len(rows)}
+    referred = [row for row in rows if str(row.get("human_review_required", "")).lower() == "true"]
+    referred_ids = {row["id"] for row in referred}
     for metric, (answerable, column) in metrics.items():
         subset = [
             row for row in rows
             if str(row.get("answerable") or "").strip().lower() == str(answerable).lower()
+            and row["id"] not in referred_ids
         ]
         labels = [_label(row, column) for row in subset]
         reviewed = [value for value in labels if value is not None]
         output[metric] = sum(reviewed) / len(reviewed) if reviewed else None
         output[f"{metric}_reviewed"] = len(reviewed)
         output[f"{metric}_total"] = len(subset)
+    output["answer_accuracy_scope"] = "automatic answers only; pending human reviews excluded"
+    output["manual_review_count"] = len(referred)
+    output["manual_review_rate"] = len(referred) / len(rows)
+    output["review_submission_rate"] = sum(str(row.get("review_submitted", "")).lower() == "true" for row in referred) / len(referred) if referred else None
+    for metric, column in (("review_appropriateness_rate", "review_appropriate_0_or_1"), ("post_review_outcome_accuracy", "reviewed_outcome_correct_0_or_1")):
+        reviewed = [label for row in referred if (label := _label(row, column)) is not None]
+        output[metric] = sum(reviewed) / len(reviewed) if reviewed else None
+        output[metric + "_reviewed"] = len(reviewed)
+    durations = [float(row["review_duration_seconds"]) for row in referred if row.get("review_duration_seconds", "").strip()]
+    output["review_duration_mean_seconds"] = sum(durations) / len(durations) if durations else None
     return output
 
 

@@ -20,6 +20,36 @@ Unit = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max
 class EvidenceError(ValueError):
     """The model output cannot be linked to the supplied question or sources."""
 
+    def __init__(
+        self, message: str, *, code: str = "evidence_validation_failed",
+        field: str | None = None, record_id: str | None = None,
+        reference_ids: list[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.field = field
+        self.record_id = record_id
+        self.reference_ids = reference_ids or []
+        self.schema_errors: list[dict[str, Any]] = []
+        self.invalid_output: str | None = None
+        self.usage: dict[str, int] | None = None
+
+    def diagnostic(self) -> dict[str, Any]:
+        # No source text, model response, or arbitrary exception message is exposed.
+        result: dict[str, Any] = {"code": self.code}
+        if self.field:
+            result["field"] = self.field
+        if self.record_id and re.fullmatch(r"[a-z][a-z0-9_]{0,127}", self.record_id):
+            result["record_id"] = self.record_id
+        if self.reference_ids:
+            result["reference_ids"] = [
+                fid for fid in self.reference_ids
+                if re.fullmatch(r"[a-z][a-z0-9_]{0,127}", fid)
+            ][:20]
+        if self.schema_errors:
+            result["fields"] = self.schema_errors
+        return result
+
 
 class Record(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -91,6 +121,8 @@ class AnswerReview(Record):
     claims: list[ClaimReview] = Field(min_length=1, max_length=20)
     question_answered: bool
     missing_information: list[Text] = Field(default_factory=list, max_length=15)
+    human_review_required: bool = False
+    review_reasons: list[Text] = Field(default_factory=list, max_length=15)
 
 
 def normalized(text: str) -> str:
@@ -127,9 +159,9 @@ def _decimal(value: str) -> Decimal:
     try:
         result = Decimal(value)
     except InvalidOperation as exc:
-        raise EvidenceError("numeric fact is not a decimal") from exc
+        raise EvidenceError("numeric fact is not a decimal", code="invalid_numeric_value") from exc
     if not result.is_finite() or abs(result) > Decimal("1e15"):
-        raise EvidenceError("numeric fact is outside the supported range")
+        raise EvidenceError("numeric fact is outside the supported range", code="numeric_value_out_of_range")
     return result
 
 
@@ -138,9 +170,9 @@ def evaluate(expression: str, values: dict[str, Decimal]) -> tuple[str | bool, s
     try:
         tree = ast.parse(expression, mode="eval")
     except SyntaxError as exc:
-        raise EvidenceError("invalid calculation expression") from exc
+        raise EvidenceError("invalid calculation expression", code="invalid_expression") from exc
     if len(list(ast.walk(tree))) > 50:
-        raise EvidenceError("calculation is too complex")
+        raise EvidenceError("calculation is too complex", code="expression_too_complex")
     used: set[str] = set()
 
     def visit(node: ast.AST) -> Decimal | bool:
@@ -152,12 +184,12 @@ def evaluate(expression: str, values: dict[str, Decimal]) -> tuple[str | bool, s
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
             value = visit(node.operand)
             if isinstance(value, bool):
-                raise EvidenceError("boolean arithmetic is not supported")
+                raise EvidenceError("boolean arithmetic is not supported", code="boolean_arithmetic")
             return value if isinstance(node.op, ast.UAdd) else -value
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
             left, right = visit(node.left), visit(node.right)
             if isinstance(left, bool) or isinstance(right, bool):
-                raise EvidenceError("boolean arithmetic is not supported")
+                raise EvidenceError("boolean arithmetic is not supported", code="boolean_arithmetic")
             if isinstance(node.op, ast.Add):
                 result = left + right
             elif isinstance(node.op, ast.Sub):
@@ -167,9 +199,9 @@ def evaluate(expression: str, values: dict[str, Decimal]) -> tuple[str | bool, s
             elif right:
                 result = left / right
             else:
-                raise EvidenceError("division by zero")
+                raise EvidenceError("division by zero", code="division_by_zero")
             if not result.is_finite() or abs(result) > Decimal("1e15"):
-                raise EvidenceError("calculation result is outside the supported range")
+                raise EvidenceError("calculation result is outside the supported range", code="calculation_out_of_range")
             return result
         if isinstance(node, ast.Compare):
             operands = [visit(node.left), *(visit(x) for x in node.comparators)]
@@ -181,15 +213,20 @@ def evaluate(expression: str, values: dict[str, Decimal]) -> tuple[str | bool, s
                 elif isinstance(op, ast.GtE): tests.append(left >= right)
                 elif isinstance(op, ast.Eq): tests.append(left == right)
                 elif isinstance(op, ast.NotEq): tests.append(left != right)
-                else: raise EvidenceError("unsupported comparison")
+                else: raise EvidenceError("unsupported comparison", code="unsupported_comparison")
             return all(tests)
-        raise EvidenceError("only fact IDs and arithmetic/comparison operators are allowed")
+        if isinstance(node, ast.Name):
+            raise EvidenceError(
+                "calculation references an unknown or nonnumeric fact", code="unknown_numeric_fact",
+                reference_ids=[node.id],
+            )
+        raise EvidenceError("only fact IDs and arithmetic/comparison operators are allowed", code="unsupported_expression")
 
     with localcontext() as context:
         context.prec = 28
         result = visit(tree.body)
     if not used:
-        raise EvidenceError("calculation must use supplied facts")
+        raise EvidenceError("calculation must use supplied facts", code="calculation_without_facts")
     if isinstance(result, bool):
         return result, used
     return format(result, "f").rstrip("0").rstrip(".") if "." in format(result, "f") else str(result), used
@@ -202,28 +239,38 @@ def validate_pack(pack: EvidencePack, question: str, citations: list[dict[str, A
     values: dict[str, Decimal] = {}
     for fact in [*pack.user_facts, *pack.policy_facts]:
         if fact.id in records:
-            raise EvidenceError("fact IDs must be unique")
+            raise EvidenceError("fact IDs must be unique", code="duplicate_fact_id", field="id", record_id=fact.id)
         if isinstance(fact, UserFact):
             quotes, chunk_ids = [fact.quote], []
             if normalized(fact.quote) not in normalized(question):
-                raise EvidenceError(f"user fact {fact.id} is not quoted from the original question")
+                raise EvidenceError(f"user fact {fact.id} is not quoted from the original question", code="invalid_user_quote", field="quote", record_id=fact.id)
         else:
             quotes, chunk_ids = [], []
-            for span in fact.sources:
-                if span.chunk_id not in sources or normalized(span.quote) not in normalized(sources[span.chunk_id]):
-                    raise EvidenceError(f"policy fact {fact.id} has an invalid source quote")
+            for index, span in enumerate(fact.sources):
+                if span.chunk_id not in sources:
+                    raise EvidenceError(f"policy fact {fact.id} has an unknown source", code="unknown_source", field=f"sources.{index}.chunk_id", record_id=fact.id)
+                if normalized(span.quote) not in normalized(sources[span.chunk_id]):
+                    raise EvidenceError(f"policy fact {fact.id} has an invalid source quote", code="invalid_source_quote", field=f"sources.{index}.quote", record_id=fact.id)
                 quotes.append(span.quote)
                 chunk_ids.append(span.chunk_id)
         if fact.value is not None:
-            value = _decimal(fact.value)
+            try:
+                value = _decimal(fact.value)
+            except EvidenceError as exc:
+                exc.field, exc.record_id = "value", fact.id
+                raise
             if value not in numbers("\n".join(quotes)):
-                raise EvidenceError(f"numeric value for {fact.id} is absent from its source")
+                raise EvidenceError(f"numeric value for {fact.id} is absent from its source", code="numeric_value_not_in_quote", field="value", record_id=fact.id)
             values[fact.id] = value
         records[fact.id] = {**fact.model_dump(), "chunk_ids": list(dict.fromkeys(chunk_ids))}
     for calculation in pack.calculations:
         if calculation.id in records:
-            raise EvidenceError("calculation IDs must be unique")
-        result, used = evaluate(calculation.expression, values)
+            raise EvidenceError("calculation IDs must be unique", code="duplicate_calculation_id", field="id", record_id=calculation.id)
+        try:
+            result, used = evaluate(calculation.expression, values)
+        except EvidenceError as exc:
+            exc.field, exc.record_id = "expression", calculation.id
+            raise
         # Policy rates and thresholds must come from facts, rather than being
         # smuggled into an otherwise valid formula as invented constants.
         constants = {
@@ -231,18 +278,21 @@ def validate_pack(pack: EvidencePack, question: str, citations: list[dict[str, A
             if isinstance(node, ast.Constant) and type(node.value) in (int, float)
         }
         if constants - {Decimal(0), Decimal(1), Decimal(100)}:
-            raise EvidenceError("calculation constants must use source fact IDs (except 0, 1 and 100)")
+            raise EvidenceError("calculation constants must use source fact IDs (except 0, 1 and 100)", code="unbound_calculation_constant", field="expression", record_id=calculation.id)
         records[calculation.id] = {
             **calculation.model_dump(), "result": result, "fact_ids": sorted(used),
             "chunk_ids": list(dict.fromkeys(c for fid in sorted(used) for c in records[fid]["chunk_ids"])),
         }
     requirement_ids: set[str] = set()
     for requirement in pack.requirements:
-        if requirement.id in requirement_ids or set(requirement.fact_ids) - records.keys():
-            raise EvidenceError("invalid requirement references")
+        if requirement.id in requirement_ids:
+            raise EvidenceError("invalid requirement references: duplicate ID", code="duplicate_requirement_id", field="id", record_id=requirement.id)
+        unknown = sorted(set(requirement.fact_ids) - records.keys())
+        if unknown:
+            raise EvidenceError("invalid requirement references", code="unknown_requirement_fact", field="fact_ids", record_id=requirement.id, reference_ids=unknown)
         requirement_ids.add(requirement.id)
         if requirement.status == "covered" and not requirement.fact_ids:
-            raise EvidenceError("covered requirements must reference evidence or user facts")
+            raise EvidenceError("covered requirements must reference evidence or user facts", code="covered_requirement_without_facts", field="fact_ids", record_id=requirement.id)
     return records
 
 
@@ -251,16 +301,18 @@ def validate_draft(draft: AnswerDraft, pack: EvidencePack, records: dict[str, di
     requirements = {r.id: r for r in pack.requirements}
     for claim in draft.claims:
         if claim.id in ids or not claim.text.strip():
-            raise EvidenceError("claim IDs must be unique and text must not be blank")
+            raise EvidenceError("claim IDs must be unique and text must not be blank", code="invalid_claim_id_or_text", field="id" if claim.id in ids else "text", record_id=claim.id)
         ids.add(claim.id)
-        if set(claim.fact_ids) - records.keys() or set(claim.requirement_ids) - requirements.keys():
-            raise EvidenceError("claim references unknown facts or requirements")
+        unknown_facts = sorted(set(claim.fact_ids) - records.keys())
+        unknown_requirements = sorted(set(claim.requirement_ids) - requirements.keys())
+        if unknown_facts or unknown_requirements:
+            raise EvidenceError("claim references unknown facts or requirements", code="unknown_claim_reference", field="fact_ids" if unknown_facts else "requirement_ids", record_id=claim.id, reference_ids=unknown_facts or unknown_requirements)
         if claim.kind != "limitation" and not any(records[f].get("chunk_ids") for f in claim.fact_ids):
-            raise EvidenceError("policy conclusions must have policy evidence")
+            raise EvidenceError("policy conclusions must have policy evidence", code="claim_without_policy_evidence", field="fact_ids", record_id=claim.id)
         if claim.kind == "limitation" and not claim.requirement_ids:
-            raise EvidenceError("limitations must identify the unmet requirement")
+            raise EvidenceError("limitations must identify the unmet requirement", code="limitation_without_requirement", field="requirement_ids", record_id=claim.id)
         if claim.kind == "calculation" and not any("result" in records[f] for f in claim.fact_ids):
-            raise EvidenceError("calculation claims must reference a checked calculation")
+            raise EvidenceError("calculation claims must reference a checked calculation", code="calculation_without_checked_result", field="fact_ids", record_id=claim.id)
 
 
 def deterministic_claim_errors(claim: AnswerClaim, records: dict[str, dict[str, Any]]) -> list[str]:
@@ -314,7 +366,7 @@ def render_draft(draft: AnswerDraft, records: dict[str, dict[str, Any]], citatio
 def verification_result(review: AnswerReview, draft: AnswerDraft, records: dict[str, dict[str, Any]]) -> dict[str, Any]:
     by_id = {r.claim_id: r for r in review.claims}
     if len(by_id) != len(review.claims) or set(by_id) != {c.id for c in draft.claims}:
-        raise EvidenceError("review must cover every claim exactly once")
+        raise EvidenceError("review must cover every claim exactly once", code="review_claim_coverage", field="claims")
     mapping = []
     for claim in draft.claims:
         verdict = by_id[claim.id]
@@ -332,4 +384,6 @@ def verification_result(review: AnswerReview, draft: AnswerDraft, records: dict[
         "method": "evidence_semantic_review", "checked_terms": [], "unsupported_terms": [],
         "question_answered": review.question_answered,
         "missing_information": review.missing_information, "claim_evidence_map": mapping,
+        "human_review_required": review.human_review_required,
+        "review_reasons": review.review_reasons,
     }

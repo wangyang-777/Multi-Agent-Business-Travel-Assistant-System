@@ -21,6 +21,7 @@
           <button class="nav-item" data-view="history">History</button>
           <button class="nav-item" data-view="knowledge">Knowledge</button>
           <button class="nav-item" data-view="eval">RAG Eval</button>
+          <button class="nav-item" data-view="reviews">人工审核</button>
           <button class="nav-item" data-view="system">System</button>
         </nav>
       </aside>
@@ -73,13 +74,30 @@
                 <button class="tab active" data-tab="tables">Tables</button>
                 <button class="tab" data-tab="approval">Approval</button>
                 <button class="tab" data-tab="citations">Citations</button>
+                <button class="tab" data-tab="review">人工审核</button>
                 <button class="tab" data-tab="trace">Meta</button>
               </div>
               <div class="tab-page active" id="tab-tables"></div>
               <div class="tab-page" id="tab-approval"></div>
               <div class="tab-page" id="tab-citations"></div>
               <div class="tab-page" id="tab-trace"></div>
+              <div class="tab-page" id="tab-review"></div>
             </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-reviews">
+          <div class="split-layout">
+            <section class="panel">
+              <h3>待审核问题</h3>
+              <form id="review-login" class="stack-form">
+                <label>审核凭据<input id="review-token" type="password" autocomplete="off" required /></label>
+                <button class="primary" type="submit">加载审核队列</button>
+              </form>
+              <p id="review-actor"></p>
+              <div id="review-list"></div>
+            </section>
+            <section class="panel" id="review-detail"><div class="empty">选择一条待审核问题。</div></section>
           </div>
         </section>
 

@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     memory_max_messages: int = 40
     memory_session_ttl_seconds: int = 86400
 
+    # Shared operator credential for the internal review console; never sent to chat clients.
+    human_review_api_token: str = ""
+    human_review_reviewer_name: str = "制度审核员"
+    human_review_ttl_seconds: int = Field(default=2592000, ge=86400)
+
     # Circuit breaker config
     circuit_breaker_failure_threshold: int = 5
     circuit_breaker_recovery_timeout: int = 30

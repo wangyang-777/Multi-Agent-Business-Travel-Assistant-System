@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any, Union
 
@@ -711,6 +712,7 @@ async def chat(
 ) -> Union[ChatResponse, StreamingResponse]:
     if not settings.openai_api_key:
         raise HTTPException(status_code=503, detail="请在 .env 中配置 OPENAI_API_KEY 后重启服务")
+    body.session_id = body.session_id or str(uuid.uuid4())
     if body.stream:
 
         async def event_gen() -> AsyncIterator[str]:
@@ -766,4 +768,6 @@ async def chat(
         rag_correction_count=int(metadata.get("rag_correction_count") or 0),
         rag_evidence=metadata.get("rag_evidence"),
         rag_stages=metadata.get("rag_stages") or [],
+        human_reviews=metadata.get("human_reviews") or [],
+        answer_status=metadata.get("answer_status", "automatic"),
     )

@@ -273,6 +273,9 @@ def evaluate(
             row["rag_evidence"] = chat.get("rag_evidence")
             row["rag_stages"] = chat.get("rag_stages") or []
             row["task_results"] = chat.get("task_results") or []
+            row["human_reviews"] = chat.get("human_reviews") or []
+            row["human_review_required"] = bool(row["human_reviews"])
+            row["review_submitted"] = bool(row["human_reviews"]) and all(review.get("status") != "submission_failed" for review in row["human_reviews"])
             row["chat_latency_ms"] = round((time.perf_counter() - chat_started) * 1000, 2)
             row["usage"] = chat.get("usage")
             row["verification_passed"] = (
@@ -299,6 +302,12 @@ def evaluate(
                 if positive_cases else 0.0
             )
     if include_chat:
+        manual = [row for row in rows if row.get("human_review_required")]
+        report["manual_review_rate"] = len(manual) / total
+        report["review_submission_rate"] = sum(bool(row.get("review_submitted")) for row in manual) / len(manual) if manual else None
+        automatic = [row for row in rows if row["answerable"] and not row.get("human_review_required")]
+        report["automatic_positive_answer_count"] = len(automatic)
+        report["automatic_keyword_match_rate"] = sum(bool(row["keyword_ok"]) for row in automatic) / len(automatic) if automatic else None
         report["keyword_match_rate"] = (
             sum(1 for row in rows if row["answerable"] and row["keyword_ok"]) / len(positive_cases)
             if positive_cases else 0.0

@@ -357,3 +357,213 @@ async def test_model_billing_error_is_distinguished_from_missing_policy(monkeypa
     assert "未检索到" not in answer and "999" not in answer
     assert "secret-provider-key" not in json.dumps(result)
     assert result["metadata"]["verification"]["upstream_status"] == 402
+
+
+@pytest.mark.parametrize("change,code,field,record_id", [
+    ("quote", "invalid_source_quote", "sources.0.quote", "p_rate"),
+    ("source", "unknown_source", "sources.0.chunk_id", "p_rate"),
+    ("value", "numeric_value_not_in_quote", "value", "p_rate"),
+    ("user", "invalid_user_quote", "quote", "q_days"),
+    ("reference", "unknown_requirement_fact", "fact_ids", "r_total"),
+    ("formula", "unknown_numeric_fact", "expression", "c_total"),
+])
+def test_evidence_diagnostics_identify_failed_record_without_source_text(change, code, field, record_id):
+    raw = allowance_pack()
+    secret = "secret-key-and-source-text"
+    if change == "quote": raw["policy_facts"][0]["sources"][0]["quote"] = secret
+    if change == "source": raw["policy_facts"][0]["sources"][0]["chunk_id"] = secret
+    if change == "value": raw["policy_facts"][0]["value"] = "999"
+    if change == "user": raw["user_facts"][0]["quote"] = secret
+    if change == "reference": raw["requirements"][0]["fact_ids"] = ["missing_fact"]
+    if change == "formula": raw["calculations"][0]["expression"] = "q_days*missing_fact"
+    with pytest.raises(EvidenceError) as caught:
+        validate_pack(EvidencePack.model_validate(raw), "3个自然日", [{"chunk_id": "allowance", "content": "每天120 元"}])
+    detail = caught.value.diagnostic()
+    assert (detail["code"], detail["field"], detail["record_id"]) == (code, field, record_id)
+    assert secret not in json.dumps(detail)
+    if change in {"reference", "formula"}:
+        assert detail["reference_ids"] == ["missing_fact"]
+
+
+@pytest.mark.parametrize("error_type", ["fact", "requirement", "calculation", "limitation", "duplicate", "schema"])
+async def test_draft_validation_repairs_once_then_runs_semantic_review(monkeypatch, error_type):
+    invalid = allowance_draft()
+    claim = invalid["claims"][0]
+    if error_type == "fact": claim["fact_ids"] = ["invented_fact"]
+    if error_type == "requirement": claim["requirement_ids"] = ["invented_requirement"]
+    if error_type == "calculation": claim["fact_ids"] = ["p_rate"]
+    if error_type == "limitation": claim.update(kind="limitation", requirement_ids=[])
+    if error_type == "duplicate": invalid["claims"].append(dict(claim))
+    if error_type == "schema": claim["kind"] = "unsupported-kind"
+    result, llm = await run_pipeline(monkeypatch, [allowance_pack(), invalid, allowance_draft(), supported_review()])
+    meta = result["metadata"]
+    assert meta["verification"]["passed"] is True
+    assert "360元" in result["choices"][0]["message"]["content"]
+    stage = next(s for s in meta["rag_stages"] if s["stage"] == "draft")
+    assert stage["repair_count"] == 1
+    assert stage["diagnostics"][-1]["event"] == "repair_succeeded"
+    assert result["usage"]["total_tokens"] == 50
+    repair_input = json.loads(llm.messages[3][1]["content"])
+    assert "previous_draft" in repair_input and "validation_detail" in repair_input
+
+
+@pytest.mark.parametrize("first_schema_error,second_schema_error", [(False, False), (True, False), (False, True)])
+async def test_schema_and_business_errors_share_one_draft_repair_budget(monkeypatch, first_schema_error, second_schema_error):
+    invalid = allowance_draft()
+    invalid["claims"][0]["fact_ids"] = ["invented_fact"]
+    first = {"claims": []} if first_schema_error else invalid
+    second = {"claims": []} if second_schema_error else invalid
+    result, llm = await run_pipeline(monkeypatch, [allowance_pack(), first, second])
+    assert len(llm.messages) == 4  # Planner, evidence, draft, one repair; no third draft call.
+    verification = result["metadata"]["verification"]
+    assert verification["passed"] is False and verification["stage"] == "draft"
+    assert verification["repair_count"] == 1
+    assert verification["diagnostics"][-1]["event"] == "repair_failed"
+    assert verification["validation_error"]["code"] == (
+        "schema_validation_failed" if second_schema_error else "unknown_claim_reference"
+    )
+    assert "360元" not in result["choices"][0]["message"]["content"]
+    assert result["usage"]["total_tokens"] == 40
+
+
+@pytest.mark.parametrize("days,threshold,rate", [(31, 30, 70), (16, 15, 85), (11, 10, 95)])
+async def test_rule_selection_can_repair_misclassified_calculation_without_inventing_formula(monkeypatch, days, threshold, rate):
+    quote = f"超过{threshold}天的，伙食补助每天{rate}元。"
+    pack = {
+        "user_facts": [{"id": "q_day", "statement": f"第{days}天", "quote": f"第{days}天", "value": str(days), "unit": "天"}],
+        "policy_facts": [{"id": "p_rule", "statement": quote, "sources": [{"chunk_id": "rule", "quote": quote}], "value": str(rate), "unit": "元/天"}],
+        "requirements": [{"id": "r_rate", "description": "对应天数标准", "status": "covered", "fact_ids": ["q_day", "p_rule"], "reason": "适用超过阈值的档位"}],
+        "calculations": [],
+    }
+    valid = {"claims": [{"id": "a_rate", "text": f"第{days}天适用每天{rate}元的标准。", "kind": "policy", "fact_ids": ["q_day", "p_rule"], "requirement_ids": ["r_rate"]}]}
+    invalid = json.loads(json.dumps(valid))
+    invalid["claims"][0]["kind"] = "calculation"
+    result, _ = await run_pipeline(monkeypatch, [pack, invalid, valid, supported_review("a_rate")], question=f"第{days}天伙食补助多少？", hits=[{"id": "rule", "content": quote}])
+    assert result["metadata"]["verification"]["passed"] is True
+    assert result["metadata"]["rag_evidence"]["pack"]["calculations"] == []
+    draft_stage = next(s for s in result["metadata"]["rag_stages"] if s["stage"] == "draft")
+    assert draft_stage["diagnostics"][0]["code"] == "calculation_without_checked_result"
+    assert f"{rate}元" in result["choices"][0]["message"]["content"]
+
+
+async def test_repaired_policy_kind_cannot_smuggle_new_amount_past_review(monkeypatch):
+    invalid = allowance_draft(999)
+    invalid["claims"][0]["fact_ids"] = ["p_rate"]
+    wrong_repair = json.loads(json.dumps(invalid))
+    wrong_repair["claims"][0]["kind"] = "policy"
+    result, _ = await run_pipeline(monkeypatch, [allowance_pack(), invalid, wrong_repair, supported_review(), allowance_draft(), supported_review()])
+    checks = [s for s in result["metadata"]["rag_stages"] if s["stage"] == "verification"]
+    assert checks[0]["passed"] is False
+    assert "999" not in result["choices"][0]["message"]["content"]
+    assert "360元" in result["choices"][0]["message"]["content"]
+
+
+async def test_failed_evidence_repair_keeps_specific_diagnostics_and_usage(monkeypatch):
+    invalid = allowance_pack()
+    invalid["policy_facts"][0]["sources"][0]["quote"] = "secret-text-not-in-source"
+    result, _ = await run_pipeline(monkeypatch, [invalid, invalid])
+    verification = result["metadata"]["verification"]
+    assert verification["stage"] == "evidence"
+    assert verification["validation_error"] == {"code": "invalid_source_quote", "field": "sources.0.quote", "record_id": "p_rate"}
+    assert verification["repair_count"] == 1
+    assert verification["diagnostics"][-1]["event"] == "repair_failed"
+    assert "secret-text-not-in-source" not in json.dumps(result)
+    assert result["usage"]["total_tokens"] == 30
+
+
+async def test_schema_diagnostics_never_log_invalid_output_or_unknown_field_names(monkeypatch, caplog):
+    secret = "sk-secret-provider-value"
+    invalid = {"claims": [], secret: secret}
+    result, _ = await run_pipeline(monkeypatch, [allowance_pack(), invalid, invalid])
+    assert secret not in caplog.text
+    assert secret not in json.dumps(result)
+    fields = result["metadata"]["verification"]["validation_error"]["fields"]
+    assert any(e["field"] == "claims" for e in fields)
+    assert any(e["field"] == "<unknown_field>" for e in fields)
+
+
+async def test_draft_repair_api_failure_does_not_return_invalid_draft(monkeypatch):
+    class BillingError(Exception):
+        status_code = 402
+
+    invalid = allowance_draft()
+    invalid["claims"][0]["fact_ids"] = ["invented_fact"]
+    result, llm = await run_pipeline(monkeypatch, [allowance_pack(), invalid, BillingError("secret-key")])
+    assert len(llm.messages) == 4
+    assert "360元" not in result["choices"][0]["message"]["content"]
+    assert "secret-key" not in json.dumps(result)
+    assert result["metadata"]["verification"]["upstream_status"] == 402
+    assert result["metadata"]["verification"]["diagnostics"][-1]["event"] == "repair_failed"
+
+
+async def test_incomplete_draft_response_is_diagnosed_without_retry():
+    class TruncatedLLM(QueueLLM):
+        async def chat_completion(self, messages, **kwargs):
+            response = await super().chat_completion(messages, **kwargs)
+            response.choices[0].finish_reason = "length"
+            return response
+
+    citations = [{"chunk_id": "allowance", "content": "每天120 元"}]
+    pack = EvidencePack.model_validate(allowance_pack())
+    records = validate_pack(pack, "3个自然日", citations)
+    llm = TruncatedLLM([allowance_draft()])
+    diagnostics = []
+    with pytest.raises(EvidenceError) as caught:
+        await EvidenceQA(llm).draft("3个自然日", pack, records, citations, diagnostics=diagnostics)
+    assert caught.value.code == "incomplete_model_response"
+    assert len(llm.messages) == 1
+    assert diagnostics == [{"operation": "answer_draft", "event": "validation_failed", "code": "incomplete_model_response", "field": "finish_reason"}]
+
+
+async def test_correction_repairs_missing_requirement_once_and_is_still_reviewed():
+    pack = EvidencePack.model_validate(allowance_pack())
+    citations = [{"chunk_id": "allowance", "content": "每天120 元"}]
+    records = validate_pack(pack, "3个自然日", citations)
+    original = AnswerDraft.model_validate(allowance_draft())
+    invalid = {"claims": [{"id": "a_total", "text": "需确认人员类别。", "kind": "limitation", "fact_ids": []}]}
+    repaired = {"claims": [{**invalid["claims"][0], "requirement_ids": ["r_total"]}]}
+    llm = QueueLLM([invalid, repaired])
+    diagnostics = []
+    corrected, usage = await EvidenceQA(llm).correct("3个自然日", pack, records, original, {"claim_evidence_map": [{"claim_id": "a_total", "status": "partial"}]}, citations, diagnostics=diagnostics)
+    assert corrected.claims[0].requirement_ids == ["r_total"]
+    assert usage["total_tokens"] == 20
+    assert [e["event"] for e in diagnostics] == ["validation_failed", "repair_started", "repair_succeeded"]
+    assert diagnostics[0]["code"] == "limitation_without_requirement"
+
+
+async def test_uncertain_answer_creates_ticket_and_saves_only_pending_answer(monkeypatch):
+    from app.services.human_review import HumanReviewStore
+    from tests.test_chat_memory import _FakeRedis
+
+    created = []
+    async def create(self, session_id, prepared):
+        created.append((session_id, prepared))
+        assert "待人工审核" in str(await self.redis.get("chat:session:" + session_id))
+        return {k: v for k, v in prepared.items() if k != "_snapshot"}
+    monkeypatch.setattr(HumanReviewStore, "create", create)
+    pack = {"requirements": [{"id": "r_ratio", "description": "早餐比例", "status": "missing", "fact_ids": [], "reason": "无具体比例"}], "search_queries": []}
+    draft = {"claims": [{"id": "a_ratio", "text": "当前检索资料未提供早餐具体比例。", "kind": "limitation", "fact_ids": [], "requirement_ids": ["r_ratio"]}]}
+    review = {"claims": [{"claim_id": "a_ratio", "status": "supported", "reason": "未编造"}], "question_answered": False, "missing_information": ["具体比例"]}
+    question = "早餐扣减多少？"
+    llm = QueueLLM([planner(question), pack, draft, review])
+    redis = _FakeRedis()
+    orch = LangGraphTravelOrchestrator(llm=llm, redis_client=redis)
+    monkeypatch.setattr(orch, "_knowledge_retrieval_available", lambda: True)
+    async def retrieve(query): return [{"id": "ratio", "content": "按标准比例扣除"}]
+    monkeypatch.setattr(orch, "_retrieve_knowledge", retrieve)
+    response = await orch.run_completion([ChatMessage(role=MessageRole.USER, content=question)], session_id="review-test")
+    assert len(created) == 1
+    assert "待人工审核" in response["choices"][0]["message"]["content"]
+    assert response["metadata"]["human_reviews"][0]["status"] == "pending"
+    assert "_snapshot" not in response["metadata"]["human_reviews"][0]
+    assert created[0][1]["_snapshot"]["question"] == question
+
+
+async def test_queue_unavailable_does_not_claim_successful_submission(monkeypatch):
+    pack = {"requirements": [{"id": "r_ratio", "description": "早餐比例", "status": "missing", "fact_ids": [], "reason": "无具体比例"}], "search_queries": []}
+    draft = {"claims": [{"id": "a_ratio", "text": "当前检索资料未提供早餐具体比例。", "kind": "limitation", "requirement_ids": ["r_ratio"]}]}
+    review = {"claims": [{"claim_id": "a_ratio", "status": "supported", "reason": "未编造"}], "question_answered": False, "missing_information": ["具体比例"]}
+    response, _ = await run_pipeline(monkeypatch, [pack, draft, review], question="早餐比例多少？")
+    assert response["metadata"]["human_reviews"][0]["status"] == "submission_failed"
+    assert response["metadata"]["human_reviews"][0]["review_id"] is None
+    assert "提交失败" in response["choices"][0]["message"]["content"]
