@@ -1,11 +1,11 @@
 """
-Agent 编排器 - 系统核心
+对话工作流编排器
 
 负责：
 1. 接收用户请求
 2. 调用意图识别引擎
-3. 根据意图选择合适的 Agent 模式（ReAct/Planner/Reflection）
-4. 路由到对应的子 Agent（行程规划/信息查询/差标管控/预订/RAG）
+3. 根据意图选择合适的处理模式（ReAct/Planner/Review）
+4. 路由到 ReAct Agent、顺序规划器或响应审阅器
 5. 管理记忆和上下文
 6. 返回结果
 """
@@ -19,9 +19,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
-from app.core.agent.planner import PlanRunResult, PlanningAgent
+from app.core.agent.planner import PlanRunResult, SequentialPlanner
 from app.core.agent.react_agent import ReActAgent, Tool, ToolResult
-from app.core.agent.reflection import ReflectionAgent
+from app.core.agent.reflection import ResponseReviewer
 from app.core.intent.recognizer import IntentRecognizer, IntentResult, TravelIntent
 from app.core.memory.short_term import ChatTurn, ShortTermMemory
 from app.core.prompt.state_machine import ConversationState, PromptStateMachine
@@ -34,7 +34,7 @@ from app.infrastructure.llm.client import ChatMessage, LLMClient
 from app.infrastructure.observability.tracer import child_span, get_trace, start_trace
 
 
-class AgentMode(str, Enum):
+class ReasoningMode(str, Enum):
     """编排层选用的推理模式。"""
 
     REACT = "react"
@@ -53,7 +53,7 @@ class OrchestratorResponse:
     session_id: str
     message: str
     intent: TravelIntent
-    mode: AgentMode
+    mode: ReasoningMode
     trace_id: str
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -128,7 +128,7 @@ class OrchestratorResult:
     tool_output: Any | None
 
 
-class TravelAgentOrchestrator:
+class TravelRAGOrchestrator:
     """面向 RAG 管道的编排：意图 → 检索 → 可选差标工具 → 生成。"""
 
     def __init__(
@@ -171,8 +171,8 @@ class TravelAgentOrchestrator:
         )
 
 
-class AgentOrchestrator:
-    """主对话编排：意图识别、模式选择、子 Agent 执行、会话记忆与 trace 事件。"""
+class ConversationOrchestrator:
+    """主对话编排：意图识别、模式选择、执行、会话记忆与 trace 事件。"""
 
     def __init__(
         self,
@@ -202,7 +202,7 @@ class AgentOrchestrator:
 
     async def process_message(self, session_id: str, user_input: str) -> OrchestratorResponse:
         if get_trace() is None:
-            start_trace("agent.orchestrator")
+            start_trace("workflow.orchestrator")
         span = child_span("orchestrator.process_message")
         try:
             span.add_event("user_input", length=len(user_input))
@@ -212,7 +212,7 @@ class AgentOrchestrator:
             sm = self._machine(session_id)
             conv_state = sm.transition(user_input, intent=ir.intent)
             ctx = await self._build_context(session_id, user_input, ir, conv_state)
-            text, extra = await self._route_to_agent(mode, ir, ctx, user_input)
+            text, extra = await self._run_mode(mode, ir, ctx, user_input)
             mem = self._memory(session_id)
             mem.append(ChatTurn(role="user", content=user_input))
             mem.append(ChatTurn(role="assistant", content=text))
@@ -243,12 +243,12 @@ class AgentOrchestrator:
     async def _recognize_intent(self, user_input: str) -> IntentResult:
         return await self._intent.recognize(user_input)
 
-    def _select_mode(self, ir: IntentResult, user_input: str) -> AgentMode:
+    def _select_mode(self, ir: IntentResult, user_input: str) -> ReasoningMode:
         if any(k in user_input for k in self._config.reflection_keywords):
-            return AgentMode.REFLECTION
+            return ReasoningMode.REFLECTION
         if ir.intent in (TravelIntent.TRIP_PLANNING, TravelIntent.APPLICATION):
-            return AgentMode.PLANNER
-        return AgentMode.REACT
+            return ReasoningMode.PLANNER
+        return ReasoningMode.REACT
 
     async def _build_context(
         self,
@@ -274,17 +274,17 @@ class AgentOrchestrator:
             ]
         )
 
-    async def _route_to_agent(
+    async def _run_mode(
         self,
-        mode: AgentMode,
+        mode: ReasoningMode,
         ir: IntentResult,
         context: str,
         user_input: str,
     ) -> tuple[str, dict[str, Any]]:
         domain = self._intent_to_domain(ir.intent)
-        if mode is AgentMode.PLANNER:
+        if mode is ReasoningMode.PLANNER:
             return await self._execute_planner(context, user_input, domain)
-        if mode is AgentMode.REFLECTION:
+        if mode is ReasoningMode.REFLECTION:
             return await self._execute_reflection(context, user_input, domain)
         return await self._execute_react(context, user_input, domain)
 
@@ -312,7 +312,7 @@ class AgentOrchestrator:
         return out
 
     async def _execute_react(self, context: str, user_input: str, domain: str) -> tuple[str, dict[str, Any]]:
-        head = self._templates.subagent_system_prompt(domain)
+        head = self._templates.domain_system_prompt(domain)
         task = f"{head}\n\n{context}"
         agent = ReActAgent(
             _ReActLLM(self._llm),
@@ -323,7 +323,7 @@ class AgentOrchestrator:
         return answer, {"react_trace": trace, "domain": domain}
 
     async def _execute_planner(self, context: str, user_input: str, domain: str) -> tuple[str, dict[str, Any]]:
-        planner = PlanningAgent(_PlannerLLM(self._llm, self._templates))
+        planner = SequentialPlanner(_PlannerLLM(self._llm, self._templates))
         try:
             result = await planner.run(user_input, context)
         except Exception as exc:  # noqa: BLE001
@@ -337,12 +337,12 @@ class AgentOrchestrator:
     async def _execute_reflection(self, context: str, user_input: str, domain: str) -> tuple[str, dict[str, Any]]:
         draft_r = await self._llm.chat(
             [
-                ChatMessage(role="system", content=self._templates.subagent_system_prompt(domain)),
+                ChatMessage(role="system", content=self._templates.domain_system_prompt(domain)),
                 ChatMessage(role="user", content=f"{context}\n{user_input}"),
             ]
         )
         draft = draft_r.content
-        agent = ReflectionAgent(_ReflectLLM(self._llm))
-        out = await agent.reflect(draft, criteria={"domain": domain})
+        reviewer = ResponseReviewer(_ReflectLLM(self._llm))
+        out = await reviewer.reflect(draft, criteria={"domain": domain})
         msg = f"问题：{out.critique}\n\n修订：{out.revised}"
         return msg, {"reflection_passed": out.passed, "domain": domain}

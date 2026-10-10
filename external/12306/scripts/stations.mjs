@@ -5,7 +5,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const CACHE_FILE = join(__dirname, '..', 'data', 'stations.json');
+const BUNDLED_CACHE_FILE = join(__dirname, '..', 'data', 'stations.json');
+const CACHE_FILE = process.env.RAILWAY_12306_CACHE_FILE || BUNDLED_CACHE_FILE;
 const CACHE_TTL = 7 * 24 * 3600 * 1000;
 
 const HEADERS = {
@@ -21,8 +22,16 @@ export async function loadStations(forceRefresh = false) {
   }
 
   console.error('Fetching station data from 12306...');
-  const raw = await fetchStationScript();
-  const data = parseStationData(raw);
+  let data;
+  try {
+    const raw = await fetchStationScript();
+    data = parseStationData(raw);
+  } catch (error) {
+    const fallback = existsSync(CACHE_FILE) ? CACHE_FILE : BUNDLED_CACHE_FILE;
+    if (!existsSync(fallback)) throw error;
+    console.error('Station refresh failed; using bundled/cached station names.');
+    return JSON.parse(readFileSync(fallback, 'utf-8')).data;
+  }
 
   mkdirSync(dirname(CACHE_FILE), { recursive: true });
   writeFileSync(CACHE_FILE, JSON.stringify({ ts: Date.now(), data }));

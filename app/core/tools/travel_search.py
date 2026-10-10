@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-import time
 import asyncio
 import json
 import os
-from datetime import date, datetime, time as dt_time, timedelta
+import re
+import time
+from datetime import date, datetime, timedelta
+from datetime import time as dt_time
 from decimal import Decimal
 from enum import Enum
-import re
 from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -176,10 +177,15 @@ def _extract_flyai_items(payload: Any) -> list[dict[str, Any]]:
 
 
 def _build_12306_skill_command(req: TrainSearchRequest) -> list[str]:
-    base_dir = Path(settings.railway_12306_skill_dir)
+    raw_base_dir = settings.railway_12306_skill_dir
+    script_path = (
+        f"{raw_base_dir.rstrip('/')}/scripts/query.mjs"
+        if raw_base_dir.startswith("/")
+        else str(Path(raw_base_dir) / "scripts" / "query.mjs")
+    )
     cmd = [
         settings.railway_12306_node_bin,
-        str(base_dir / "scripts" / "query.mjs"),
+        script_path,
         req.origin_station,
         req.dest_station,
         "-d",
@@ -423,10 +429,18 @@ async def _search_trains_via_12306_skill(req: TrainSearchRequest) -> dict[str, A
 
     cmd = _build_12306_skill_command(req)
     try:
+        node_env = os.environ.copy()
+        # Node 24+ otherwise ignores HTTP_PROXY/HTTPS_PROXY for built-in fetch.
+        node_env.setdefault("NODE_USE_ENV_PROXY", "1")
+        cache_root = Path(node_env.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+        node_env.setdefault(
+            "RAILWAY_12306_CACHE_FILE", str(cache_root / "travel-agent-12306" / "stations.json")
+        )
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=node_env,
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(),
@@ -923,20 +937,21 @@ class FlyAITravelInventoryProvider:
 
 
 def _provider() -> TravelInventoryProvider:
-    if settings.travel_inventory_provider.lower() == "flyai":
+    provider = settings.travel_inventory_provider.lower()
+    if provider == "demo":
+        return DemoTravelInventoryProvider()
+    if provider == "flyai":
         return FlyAITravelInventoryProvider()
-    if (
-        settings.travel_inventory_provider.lower() == "amadeus"
-        and settings.amadeus_client_id
-        and settings.amadeus_client_secret
-    ):
+    if provider == "amadeus":
+        if not settings.amadeus_client_id or not settings.amadeus_client_secret:
+            raise RuntimeError("Amadeus 未配置 CLIENT_ID 或 CLIENT_SECRET")
         return AmadeusTravelInventoryProvider()
-    return DemoTravelInventoryProvider()
+    raise ValueError(f"未知航班/酒店供应商: {provider}")
 
 
 async def search_flights(req: FlightSearchRequest) -> dict[str, Any]:
-    provider = _provider()
     try:
+        provider = _provider()
         results = await provider.search_flights(req)
     except Exception as exc:  # noqa: BLE001
         provider_name = settings.travel_inventory_provider.lower()
@@ -963,8 +978,8 @@ async def search_flights(req: FlightSearchRequest) -> dict[str, Any]:
 
 
 async def search_hotels(req: HotelSearchRequest) -> dict[str, Any]:
-    provider = _provider()
     try:
+        provider = _provider()
         results = await provider.search_hotels(req)
     except Exception as exc:  # noqa: BLE001
         provider_name = settings.travel_inventory_provider.lower()

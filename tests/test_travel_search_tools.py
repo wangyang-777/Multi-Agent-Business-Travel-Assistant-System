@@ -18,6 +18,7 @@ from app.core.tools.travel_search import (
     _normalize_12306_skill_results,
     _rank_train_results,
     recommend_travel_options,
+    search_flights,
     search_trains,
 )
 from app.domain.schemas import ChatMessage, MessageRole
@@ -51,6 +52,23 @@ async def test_recommend_travel_options_tool_returns_flight_and_hotel(monkeypatc
     assert payload["flights"]
     assert payload["hotels"]
     assert payload["recommendation"]["flight"]["flight_no"]
+
+
+@pytest.mark.asyncio
+async def test_amadeus_missing_credentials_does_not_return_demo_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.core.tools.travel_search.settings.travel_inventory_provider", "amadeus")
+    monkeypatch.setattr("app.core.tools.travel_search.settings.amadeus_client_id", "")
+    monkeypatch.setattr("app.core.tools.travel_search.settings.amadeus_client_secret", "")
+
+    payload = await search_flights(
+        FlightSearchRequest(origin="北京", destination="上海", depart_date=date(2026, 5, 18))
+    )
+
+    assert payload["provider"] == "amadeus"
+    assert payload["results"] == []
+    assert "未配置" in payload["error"]
 
 
 @pytest.mark.asyncio

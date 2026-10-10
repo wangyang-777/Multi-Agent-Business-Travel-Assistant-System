@@ -1,6 +1,4 @@
-"""
-各 Agent 与对话状态对应的提示词模板库。
-"""
+"""各处理模式与对话状态对应的提示词模板库。"""
 
 from __future__ import annotations
 
@@ -59,7 +57,7 @@ class PromptTemplateLibrary:
         user = f"草稿：\n{draft}\n\n标准：{crit}\n输出：问题列表 + 修订版摘要。"
         return PromptBundle(system=system, user_prefix=user)
 
-    def subagent_system_prompt(self, domain: str) -> str:
+    def domain_system_prompt(self, domain: str) -> str:
         domain_hints = {
             "trip_planning": "专注行程与时间线，考虑交通衔接与差标。",
             "info_query": "专注事实查询与引用来源，不确定则说明。",

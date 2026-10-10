@@ -1,8 +1,12 @@
+from pathlib import Path
+from typing import Literal
+
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """应用与 Agent 运行时配置（自环境变量与 `.env` 加载）。"""
+    """应用与工作流运行时配置（自环境变量与 `.env` 加载）。"""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -16,6 +20,24 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 1536
     embedding_max_tokens: int = 8192
     embedding_chunk_max_tokens: int = 7000
+    rag_keyword_top_k: int = 20
+    rag_vector_top_k: int = 20
+    rag_rrf_k: int = 60
+    rag_fused_top_k: int = 20
+    rag_final_top_k: int = 5
+    rag_evidence_timeout_seconds: float = Field(default=120.0, gt=0, le=180)
+    rag_evidence_task_timeout_seconds: float = Field(default=360.0, gt=0, le=900)
+    rag_evidence_max_supplemental_queries: int = Field(default=1, ge=0, le=2)
+    rag_evidence_chunk_max_chars: int = Field(default=8000, ge=1000, le=20000)
+    rag_semantic_pdf_enabled: bool = True
+    rag_semantic_min_chars: int = Field(default=100, ge=1)
+    rag_semantic_target_chars: int = Field(default=180, ge=1)
+    rag_semantic_max_chars: int = Field(default=300, ge=1)
+    rag_reranker_enabled: bool = False
+    rag_reranker_api_key: str = ""
+    rag_reranker_url: str = ""
+    rag_reranker_model: str = "qwen3.7-text-rerank"
+    keyword_index_redis_key: str = "knowledge:keyword:chunks"
     travel_inventory_provider: str = "demo"
     amadeus_client_id: str = ""
     amadeus_client_secret: str = ""
@@ -24,7 +46,9 @@ class Settings(BaseSettings):
     flyai_api_key: str = ""
     flyai_timeout_s: float = 45.0
     travel_search_max_results: int = 5
-    railway_12306_skill_dir: str = ""
+    railway_12306_skill_dir: str = str(
+        Path(__file__).resolve().parent.parent / "external" / "12306"
+    )
     railway_12306_node_bin: str = "node"
     railway_mcp_url: str = ""
     railway_mcp_timeout_s: float = 30.0
@@ -34,13 +58,23 @@ class Settings(BaseSettings):
     milvus_port: int = 19530
     log_level: str = "INFO"
 
-    # Agent config
+    # Workflow config
     agent_orchestrator_backend: str = "langgraph"
     max_react_iterations: int = 10
+    travel_validation_max_retries: int = 1
+    planner_response_format: Literal["json_schema", "json_object"] = "json_schema"
+    planner_timeout_seconds: float = Field(default=30.0, gt=0)
+    task_max_concurrency: int = Field(default=3, ge=1, le=8)
+    task_timeout_seconds: float = Field(default=120.0, gt=0)
     memory_window_size: int = 20
     memory_summary_threshold: int = 15
     memory_max_messages: int = 40
     memory_session_ttl_seconds: int = 86400
+
+    # Shared operator credential for the internal review console; never sent to chat clients.
+    human_review_api_token: str = ""
+    human_review_reviewer_name: str = "制度审核员"
+    human_review_ttl_seconds: int = Field(default=2592000, ge=86400)
 
     # Circuit breaker config
     circuit_breaker_failure_threshold: int = 5

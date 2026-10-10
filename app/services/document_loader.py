@@ -5,8 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from app.services.document_parser import extract_text_from_file
-
+from app.services.document_parser import extract_pdf_document, extract_text_from_file
 
 SUPPORTED_DOCUMENT_EXTENSIONS = {
     ".txt",
@@ -40,17 +39,27 @@ def load_document_from_file(filename: str, data: bytes) -> LoadedDocument:
         supported = ", ".join(sorted(SUPPORTED_DOCUMENT_EXTENSIONS))
         raise DocumentLoadError(f"不支持的文件类型：{suffix or 'unknown'}，当前支持 {supported}")
 
+    if suffix == ".pdf":
+        try:
+            text, metadata = extract_pdf_document(data)
+        except Exception as exc:
+            raise DocumentLoadError(f"PDF 版面解析失败：{exc!s}") from exc
+        return LoadedDocument(
+            text=text,
+            loader=str(metadata.get("loader") or "pdf"),
+            element_count=int(metadata.get("page_count") or (1 if text.strip() else 0)),
+            metadata={"filename": filename, **metadata},
+        )
+
     if suffix in UNSTRUCTURED_FIRST_EXTENSIONS:
         try:
             loaded = _load_with_unstructured(filename, data)
             if loaded.text.strip():
                 return loaded
-        except ImportError as exc:
-            if suffix not in {".txt", ".md", ".pdf", ".docx"}:
-                raise DocumentLoadError(f"{suffix} 文件需要安装本地 Unstructured 解析依赖") from exc
+        except ImportError:
+            pass
         except Exception:
-            if suffix not in {".txt", ".md", ".pdf", ".docx"}:
-                raise
+            pass
 
     try:
         text = extract_text_from_file(filename, data)
@@ -82,9 +91,13 @@ def _load_with_unstructured(filename: str, data: bytes) -> LoadedDocument:
         if not text:
             continue
         category = getattr(element, "category", None) or element.__class__.__name__
-        page_number = getattr(getattr(element, "metadata", None), "page_number", None)
+        element_metadata = getattr(element, "metadata", None)
+        page_number = getattr(element_metadata, "page_number", None)
         prefix = f"[Page {page_number}] " if page_number else ""
-        if category in {"Title", "Header", "Footer"}:
+        if category == "Title" and suffix == ".md":
+            depth = int(getattr(element_metadata, "category_depth", 0) or 0)
+            blocks.append(f"{'#' * min(depth + 1, 6)} {text}")
+        elif category in {"Title", "Header", "Footer"}:
             blocks.append(f"\n{prefix}{text}")
         else:
             blocks.append(f"{prefix}{text}")

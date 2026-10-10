@@ -28,7 +28,7 @@ class RegisteredTool:
 
 
 class ToolRegistry:
-    """Registers agent tools and exposes an MCP-compatible tool catalog."""
+    """Registers workflow tools and exposes an MCP-compatible tool catalog."""
 
     def __init__(self) -> None:
         self._tools: dict[str, RegisteredTool] = {}

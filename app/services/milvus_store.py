@@ -11,7 +11,6 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 COLLECTION_NAME = "travel_knowledge"
-_EMBED_DIM = 1536
 
 
 def _load_pymilvus() -> tuple[Any, ...]:
@@ -59,7 +58,10 @@ class MilvusDocumentStore:
                     FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=512),
                     FieldSchema(name="doc_type", dtype=DataType.VARCHAR, max_length=32),
                     FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=65535),
-                    FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=_EMBED_DIM),
+                    FieldSchema(
+                        name="embedding", dtype=DataType.FLOAT_VECTOR,
+                        dim=settings.embedding_dimensions,
+                    ),
                 ]
                 schema = MilvusCollectionSchema(fields, description="Business travel knowledge base")
                 col = MilvusCollection(name=self.collection_name, schema=schema)
@@ -165,7 +167,9 @@ class MilvusDocumentStore:
             )
         return hits
 
-    def list_documents(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def list_documents(
+        self, limit: int = 100, *, content_limit: int = 2000
+    ) -> List[Dict[str, Any]]:
         if not self._collection:
             raise RuntimeError("Milvus not connected")
         self._collection.load()
@@ -179,7 +183,7 @@ class MilvusDocumentStore:
                 "id": row.get("id"),
                 "title": row.get("title"),
                 "doc_type": row.get("doc_type"),
-                "content": str(row.get("content") or "")[:2000],
+                "content": str(row.get("content") or "")[:content_limit],
             }
             for row in rows
         ]

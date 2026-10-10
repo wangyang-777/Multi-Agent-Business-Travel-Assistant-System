@@ -1,6 +1,4 @@
-"""
-规划 Agent：将目标拆解为步骤并按序执行（每步可为子调用或占位）。
-"""
+"""顺序规划器：将目标拆解为步骤并按序执行。"""
 
 from __future__ import annotations
 
@@ -28,7 +26,7 @@ class PlanRunResult:
     summary: str = ""
 
 
-class PlanningAgent:
+class SequentialPlanner:
     """
     将用户目标分解为有序步骤，依次调用执行器并汇总。
 

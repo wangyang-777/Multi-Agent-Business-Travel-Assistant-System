@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import re
 import time
@@ -8,18 +10,23 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, TypedDict
 from zoneinfo import ZoneInfo
 
+from langgraph.types import Command
+
 from app.agent.orchestrator import (
     TravelOrchestrator,
-    _to_openai_messages,
     _runtime_system_prompt,
+    _to_openai_messages,
     _travel_tools,
 )
+from app.agent.task_scheduler import execute_task_plan
 from app.config import settings
-from app.core.intent.recognizer import IntentRecognizer, TravelIntent
-from app.domain.schemas import ChatMessage, MessageRole
+from app.core.intent.recognizer import TravelIntent
+from app.domain.schemas import ChatMessage, MessageRole, StreamChunk, StreamChunkType
+from app.domain.task_plan import ExecutionPlan, PlannedTask, execution_plan_response_format
+from app.core.rag.evidence import AnswerDraft, EvidenceError, EvidencePack, render_draft
+from app.services.evidence_qa import EvidenceQA, diagnostic_summary
 from app.services.embeddings import EmbeddingService
-
-from langgraph.types import Command
+from app.services.human_review import HumanReviewStore, prepare_review
 
 
 class TravelGraphState(TypedDict, total=False):
@@ -44,49 +51,112 @@ class TravelGraphState(TypedDict, total=False):
     execution_plan: dict[str, Any] | None
     policy_constraints: dict[str, Any] | None
     policy_validation: dict[str, Any] | None
+    travel_attempt: int
+    travel_retry_count: int
+    travel_retry_feedback: dict[str, Any] | None
+    travel_retry_exhausted: bool
     risk_level: str | None
     answer_mode: str | None
     verification: dict[str, Any] | None
+    claim_evidence_map: list[dict[str, Any]]
+    rag_correction_count: int
     reflection_notes: str
+    conversation_messages: list[ChatMessage]
+    active_task: dict[str, Any] | None
+    task_results: list[dict[str, Any]]
+    plan_error: str | None
+    planner_usage: dict[str, int] | None
+    dependency_context: str
+    rag_question: str
+    rag_task_request: str
+    rag_evidence: dict[str, Any] | None
+    rag_draft: dict[str, Any] | None
+    rag_stages: list[dict[str, Any]]
+    human_review: dict[str, Any] | None
 
 
 class LangGraphTravelOrchestrator(TravelOrchestrator):
-    """LangGraph-backed multi-agent orchestration with the legacy chat API shape."""
+    """LangGraph workflow with one tool-using ReAct agent and supporting nodes."""
 
-    def __init__(self, *args: Any, document_store: Any | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        document_store: Any | None = None,
+        rag_retriever: Any | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
-        self._intent = IntentRecognizer()
         self._document_store = document_store
+        self._rag_retriever = rag_retriever
+        self._evidence_qa = EvidenceQA(self._llm, timeout_seconds=settings.rag_evidence_timeout_seconds)
+        self._task_graph = self._build_task_graph()
         self._graph = self._build_graph()
 
     def _build_graph(self) -> Any:
         from langgraph.graph import END, START, StateGraph
 
         graph = StateGraph(TravelGraphState)
-        graph.add_node("context_agent", self._context_agent)
-        graph.add_node("memory_fusion_agent", self._memory_fusion_agent)
-        graph.add_node("guardrail_agent", self._guardrail_agent)
-        graph.add_node("planner_agent", self._planner_agent)
-        graph.add_node("intent_agent", self._intent_agent)
-        graph.add_node("policy_reasoner_agent", self._policy_reasoner_agent)
-        graph.add_node("rag_agent", self._rag_agent)
-        graph.add_node("travel_react_agent", self._travel_react_agent)
-        graph.add_node("policy_validator_agent", self._policy_validator_agent)
-        graph.add_node("approval_agent", self._approval_agent)
-        graph.add_node("general_agent", self._general_agent)
-        graph.add_node("verification_agent", self._verification_agent)
-        graph.add_node("reflection_agent", self._reflection_agent)
-        graph.add_node("finalizer_agent", self._finalizer_agent)
+        graph.add_node("context_builder", self._context_builder)
+        graph.add_node("memory_fusion", self._memory_fusion)
+        graph.add_node("input_guardrail", self._input_guardrail)
+        graph.add_node("planner", self._planner)
+        graph.add_node("intent_router", self._intent_router)
+        graph.add_node("multi_task_executor", self._multi_task_executor)
+        self._add_execution_nodes(graph)
+        graph.add_node("response_finalizer", self._response_finalizer)
 
-        graph.add_edge(START, "context_agent")
-        graph.add_edge("context_agent", "memory_fusion_agent")
-        graph.add_edge("memory_fusion_agent", "guardrail_agent")
-        graph.add_edge("verification_agent", "finalizer_agent")
-        graph.add_edge("reflection_agent", "finalizer_agent")
-        graph.add_edge("finalizer_agent", END)
+        graph.add_edge(START, "context_builder")
+        graph.add_edge("context_builder", "memory_fusion")
+        graph.add_edge("memory_fusion", "input_guardrail")
+        graph.add_edge("response_finalizer", END)
         return graph.compile()
 
-    async def _context_agent(self, state: TravelGraphState) -> dict[str, Any]:
+    def _add_execution_nodes(self, graph: Any) -> None:
+        """Reuse the same business and verification nodes in each isolated task."""
+        graph.add_node("policy_reasoner", self._policy_reasoner)
+        graph.add_node("rag_responder", self._rag_responder)
+        graph.add_node("rag_evidence_builder", self._rag_evidence_builder)
+        graph.add_node("rag_answer_generator", self._rag_answer_generator)
+        graph.add_node("travel_react_agent", self._travel_react_agent)
+        graph.add_node("policy_validator", self._policy_validator)
+        graph.add_node("travel_retry_router", self._travel_retry_router)
+        graph.add_node("approval_processor", self._approval_processor)
+        graph.add_node("general_responder", self._general_responder)
+        graph.add_node("grounding_verifier", self._grounding_verifier)
+        graph.add_node("rag_self_corrector", self._rag_self_corrector)
+        graph.add_node("response_reviewer", self._response_reviewer)
+
+    def _build_task_graph(self) -> Any:
+        from langgraph.graph import END, START, StateGraph
+
+        graph = StateGraph(TravelGraphState)
+        graph.add_node("task_entry", self._task_entry)
+        self._add_execution_nodes(graph)
+        # Child tasks never persist conversations or overwrite the session's latest draft.
+        graph.add_node("response_finalizer", self._finish_task)
+        graph.add_edge(START, "task_entry")
+        graph.add_edge("response_finalizer", END)
+        return graph.compile()
+
+    async def _task_entry(
+        self, state: TravelGraphState
+    ) -> Command[Literal["policy_reasoner", "rag_responder", "general_responder"]]:
+        return Command(goto=self._route_after_intent(state.get("intent")))
+
+    async def _finish_task(self, state: TravelGraphState) -> dict[str, Any]:
+        inventory_issue = self._inventory_issue(state)
+        answer = self._enforce_enterprise_answer_contract(
+            inventory_issue or state.get("answer", ""), self._current_attempt_tool_trace(state),
+            state.get("effective_messages") or state["messages"],
+        )
+        review = state.get("human_review") or prepare_review(state, answer)
+        if review:
+            answer = "【待人工审核】当前问题存在尚未确认的条件，审核后提供正式答复。\n\n候选资料摘要（尚未人工审核，不作为最终结论）：\n" + answer
+        return {"answer": answer, "human_review": review, "rag_stages": self._rag_stage(
+            state, "final", {"answer": answer, "answer_mode": state.get("answer_mode")},
+        ) if state.get("rag_stages") else []}
+
+    async def _context_builder(self, state: TravelGraphState) -> dict[str, Any]:
         incoming = state["messages"]
         session_id = state.get("session_id")
         effective_messages = await self._effective_messages(incoming, session_id)
@@ -96,24 +166,38 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         openai_messages.extend(_to_openai_messages(messages))
         return {
             "effective_messages": effective_messages,
+            "conversation_messages": effective_messages,
             "openai_messages": openai_messages,
             "tool_trace": [],
-            "trace": self._append_trace(state, "context_agent", "prepared"),
+            "trace": self._append_trace(state, "context_builder", "prepared"),
             "citations": [],
             "approval_form": None,
             "booking_draft": None,
             "execution_plan": None,
             "policy_constraints": None,
             "policy_validation": None,
+            "travel_attempt": 0,
+            "travel_retry_count": 0,
+            "travel_retry_feedback": None,
+            "travel_retry_exhausted": False,
             "risk_level": "low",
             "answer_mode": None,
             "verification": None,
+            "claim_evidence_map": [],
+            "rag_correction_count": 0,
             "memory_context": "",
             "long_term_memories": [],
             "current_facts": [],
+            "active_task": None,
+            "task_results": [],
+            "plan_error": None,
+            "planner_usage": None,
+            "dependency_context": "",
+            "rag_question": "", "rag_task_request": "", "rag_evidence": None,
+            "rag_draft": None, "rag_stages": [], "human_review": None,
         }
 
-    async def _memory_fusion_agent(self, state: TravelGraphState) -> dict[str, Any]:
+    async def _memory_fusion(self, state: TravelGraphState) -> dict[str, Any]:
         text = self._last_user_text(state.get("effective_messages") or state["messages"])
         memory_owner = state.get("user_id") or state.get("session_id")
         current_facts = self._extract_long_term_facts(text)
@@ -132,7 +216,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             "long_term_memories": stored_memories,
             "trace": self._append_trace(
                 state,
-                "memory_fusion_agent",
+                "memory_fusion",
                 "fused",
                 {
                     "current_facts": len(current_facts),
@@ -142,111 +226,361 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             ),
         }
 
-    async def _guardrail_agent(
+    async def _input_guardrail(
         self, state: TravelGraphState
-    ) -> Command[Literal["planner_agent", "finalizer_agent"]]:
+    ) -> Command[Literal["planner", "response_finalizer"]]:
         text = self._last_user_text(state.get("effective_messages") or state["messages"])
         blocked = self._input_guardrail_message(text)
         trace = self._append_trace(
             state,
-            "guardrail_agent",
+            "input_guardrail",
             "blocked" if blocked else "passed",
         )
         if blocked:
             return Command(
                 update={"answer": blocked, "trace": trace, "risk_level": "medium"},
-                goto="finalizer_agent",
+                goto="response_finalizer",
             )
-        return Command(update={"trace": trace}, goto="planner_agent")
+        return Command(update={"trace": trace}, goto="planner")
 
-    async def _planner_agent(
+    async def _planner(
         self, state: TravelGraphState
-    ) -> Command[Literal["intent_agent"]]:
-        text = self._last_user_text(state.get("effective_messages") or state["messages"])
+    ) -> Command[Literal["intent_router"]]:
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
                 "content": (
-                    "你是企业商旅 Planner Agent。请把用户目标拆成结构化执行计划，只输出 JSON，"
-                    "字段包括 goal, slots, required_tools, missing_slots, steps, needs_clarification, rationale。"
-                    "required_tools 只能从 recommend_travel_options, search_flights, search_trains, search_hotels, "
-                    "check_travel_policy, rag_policy_lookup 中选择。不要编造工具结果。"
+                    "你是企业商旅意图识别与任务规划器。用一次分析完整识别本轮用户的所有任务，"
+                    "只输出符合 JSON Schema 的 JSON 实例。primary_intent 必须属于某个任务的 intent。"
+                    "tasks 是能够独立交付结果的业务任务，不是工具调用列表。查航班并解释报销流程拆成两个任务；"
+                    "生成符合差标的完整出差方案可作为一个 trip_planning 任务，内部工具步骤不要另拆任务。"
+                    "policy/rag 表示制度知识问答；info_query 表示知识查询；需要实时库存时使用对应 search 意图。"
+                    "booking/application 表示草稿或审批准备，不能承诺已预订、付款或已提交。"
+                    "每个任务的 request 必须独立完整，保留否定、日期、偏好和限制；slots 使用工具参数名。"
+                    "结合会话上下文解析指代，用户本轮明确修改优先；不得补造未知参数、库存或制度。"
+                    "未知或不适用槽位填 null，缺少执行必填参数时填写 missing_slots 和 clarification_question。"
+                    "没有缺失信息时 clarification_question 为 null。依赖另一任务结果才填写 depends_on，"
+                    "依赖必须使用有效任务 ID，禁止环路；不要仅为排列顺序创造依赖。"
+                    "闲聊也返回一个 general 任务。航班必需 origin/destination/depart_date；"
+                    "火车必需 origin_station/dest_station/depart_date；酒店必需 city/check_in/check_out；"
+                    "行程、申请、预订草稿必需 employee_id/grade/origin_city/destination_city/departure_date。"
+                    f"当前日期：{datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()}，时区 Asia/Shanghai。"
                 ),
             }
         ]
         if state.get("memory_context"):
             messages.append({"role": "system", "content": state["memory_context"]})
-        messages.append({"role": "user", "content": f"用户问题：{text}"})
+        if state.get("user_id"):
+            messages.append({"role": "system", "content": f"当前用户标识：{state['user_id']}"})
+        history = state.get("effective_messages") or state["messages"]
+        messages.extend(_to_openai_messages(history[-settings.memory_window_size:]))
+        response_format = execution_plan_response_format()
+        if settings.planner_response_format == "json_object":
+            messages[0]["content"] += "\nJSON Schema：" + json.dumps(
+                response_format["json_schema"]["schema"], ensure_ascii=False
+            )
+            response_format = {"type": "json_object"}
 
-        plan: dict[str, Any]
+        plan: dict[str, Any] | None = None
+        error: str | None = None
         usage: dict[str, int] | None = state.get("usage")
         try:
-            resp = await self._llm.chat_completion(messages, temperature=0.0)
+            resp = await asyncio.wait_for(
+                self._llm.chat_completion(
+                    messages, temperature=0.0, response_format=response_format
+                ), timeout=settings.planner_timeout_seconds,
+            )
             usage = self._usage_dict(resp)
-            plan = self._coerce_execution_plan(self._parse_json_object(resp.choices[0].message.content or ""), text)
+            choice = resp.choices[0]
+            if getattr(choice, "finish_reason", None) not in (None, "stop"):
+                raise ValueError("Incomplete plan")
+            if getattr(choice.message, "refusal", None):
+                raise ValueError("Planning refused")
+            validated = ExecutionPlan.model_validate_json(choice.message.content or "")
+            plan = validated.model_dump(mode="json")
         except Exception as exc:  # noqa: BLE001
-            plan = self._fallback_execution_plan(text, error=str(exc))
+            # Never convert a failed multi-task plan into a guessed single task.
+            error = type(exc).__name__
 
         return Command(
             update={
                 "execution_plan": plan,
-                "usage": usage,
+                "plan_error": error,
+                "planner_usage": usage,
+                "usage": None,
                 "trace": self._append_trace(
                     state,
-                    "planner_agent",
-                    "planned",
+                    "planner",
+                    "invalid_plan" if error else "planned",
                     {
-                        "required_tools": plan.get("required_tools", []),
-                        "needs_clarification": plan.get("needs_clarification", False),
+                        "primary_intent": plan.get("primary_intent") if plan else None,
+                        "task_count": len(plan["tasks"]) if plan else 0,
+                        "error": error,
                     },
                 ),
             },
-            goto="intent_agent",
+            goto="intent_router",
         )
 
-    async def _intent_agent(
+    async def _intent_router(
         self, state: TravelGraphState
-    ) -> Command[Literal["policy_reasoner_agent", "rag_agent", "general_agent"]]:
-        text = self._last_user_text(state.get("effective_messages") or state["messages"])
-        result = await self._intent.recognize(text)
-        intent = result.intent.value
+    ) -> Command[Literal[
+        "policy_reasoner", "rag_responder", "general_responder",
+        "multi_task_executor", "response_finalizer",
+    ]]:
+        try:
+            plan = ExecutionPlan.model_validate_json(json.dumps(state.get("execution_plan")))
+        except ValueError:
+            return self._clarify_plan(
+                state, "暂时无法可靠生成任务计划。请重试，或明确列出需要完成的任务及条件。"
+            )
+        missing: list[str] = []
+        for task in plan.tasks:
+            fields = self._missing_task_slots(task)
+            if fields:
+                missing.append(f"{task.request}：{', '.join(fields)}")
+        if missing or plan.clarification_question:
+            question = plan.clarification_question or "请补充以下任务所需的信息。"
+            if missing:
+                question += "\n" + "\n".join(missing)
+            return self._clarify_plan(state, question)
+
+        intent = plan.primary_intent.value
+        multi = len(plan.tasks) > 1
+        update: dict[str, Any] = {}
+        if not multi:
+            update = self._task_state(state, plan.tasks[0].model_dump(mode="json"), [])
+        route = "multi_task" if multi else "single_task"
         return Command(
             update={
+                **update,
                 "intent": intent,
+                "route": route,
                 "trace": self._append_trace(
-                    state, "intent_agent", "classified", {"intent": intent}
+                    state, "intent_router", route, {"intent": intent, "task_count": len(plan.tasks)}
                 ),
             },
-            goto=self._route_after_intent(intent, text),
+            goto="multi_task_executor" if multi else self._route_after_intent(intent),
         )
 
     def _route_after_intent(
-        self, intent: str | None, text: str
-    ) -> Literal["policy_reasoner_agent", "rag_agent", "general_agent"]:
+        self, intent: str | None, text: str = ""
+    ) -> Literal["policy_reasoner", "rag_responder", "general_responder"]:
         travel_intents = {
             TravelIntent.SEARCH_FLIGHT.value,
             TravelIntent.SEARCH_HOTEL.value,
             TravelIntent.SEARCH_TRAIN.value,
             TravelIntent.TRIP_PLANNING.value,
             TravelIntent.APPLICATION.value,
-            TravelIntent.POLICY.value,
             TravelIntent.BOOKING.value,
         }
-        if self._is_inventory_or_planning_request(text):
-            return "policy_reasoner_agent"
-        if self._should_use_rag(intent, text):
-            return "rag_agent"
-        return "policy_reasoner_agent" if intent in travel_intents else "general_agent"
+        if intent in {TravelIntent.POLICY.value, TravelIntent.RAG.value, TravelIntent.INFO_QUERY.value}:
+            return "rag_responder"
+        return "policy_reasoner" if intent in travel_intents else "general_responder"
+
+    def _clarify_plan(
+        self, state: TravelGraphState, question: str
+    ) -> Command[Literal["response_finalizer"]]:
+        return Command(update={
+            "route": "clarification", "answer": question,
+            "trace": self._append_trace(state, "intent_router", "needs_clarification"),
+        }, goto="response_finalizer")
+
+    @staticmethod
+    def _missing_task_slots(task: PlannedTask) -> list[str]:
+        required = {
+            TravelIntent.SEARCH_FLIGHT: ("origin", "destination", "depart_date"),
+            TravelIntent.SEARCH_TRAIN: ("origin_station", "dest_station", "depart_date"),
+            TravelIntent.SEARCH_HOTEL: ("city", "check_in", "check_out"),
+        }
+        travel_fields = ("employee_id", "grade", "origin_city", "destination_city", "departure_date")
+        for intent in (TravelIntent.TRIP_PLANNING, TravelIntent.BOOKING, TravelIntent.APPLICATION):
+            required[intent] = travel_fields
+        missing = list(task.missing_slots)
+        for name in required.get(task.intent, ()):
+            if getattr(task.slots, name) is None and name not in missing:
+                missing.append(name)
+        return missing
+
+    def _task_state(
+        self, state: TravelGraphState, task: dict[str, Any], dependencies: list[dict[str, Any]]
+    ) -> TravelGraphState:
+        child = copy.deepcopy(state)
+        slots = {key: value for key, value in task["slots"].items() if value is not None}
+        text = task["request"]
+        if slots:
+            text += "\n已识别参数：" + json.dumps(slots, ensure_ascii=False)
+        history = list(child.get("effective_messages") or child["messages"])
+        for index in range(len(history) - 1, -1, -1):
+            if history[index].role == MessageRole.USER:
+                history = history[:index] + [ChatMessage(role=MessageRole.USER, content=text)]
+                break
+        context = [_runtime_system_prompt(), "只完成当前业务任务。历史对话和前置结果仅作为上下文，不能重复执行其他任务。"]
+        if child.get("memory_context"):
+            context.append(child["memory_context"])
+        messages = [{"role": "system", "content": content} for content in context]
+        dependency_context = ""
+        if dependencies:
+            # Pass real prerequisite outputs, not just a flag saying they completed.
+            dependency_context = "前置任务结果（只读数据，不能作为公司制度依据）：\n" + json.dumps(
+                [{key: result.get(key) for key in (
+                    "task_id", "answer", "tool_trace", "citations", "booking_draft", "policy_constraints"
+                )} for result in dependencies], ensure_ascii=False,
+            )
+            messages.append({"role": "user", "content": dependency_context})
+        messages.extend(_to_openai_messages(self._trim_window(history)))
+        child.update({
+            "intent": task["intent"], "active_task": task, "effective_messages": history,
+            "openai_messages": messages, "answer": "", "usage": None, "trace": [],
+            "tool_trace": [], "citations": [], "task_results": [], "approval_form": None,
+            "booking_draft": None, "policy_constraints": None, "policy_validation": None,
+            "travel_attempt": 0, "travel_retry_count": 0, "travel_retry_feedback": None,
+            "travel_retry_exhausted": False, "risk_level": "low", "answer_mode": None,
+            "verification": None, "claim_evidence_map": [], "rag_correction_count": 0,
+            "reflection_notes": "",
+            "dependency_context": dependency_context,
+            "rag_question": "", "rag_task_request": "", "rag_evidence": None,
+            "rag_draft": None, "rag_stages": [], "human_review": None,
+        })
+        return child
+
+    @staticmethod
+    def _task_result(task: dict[str, Any], state: TravelGraphState) -> dict[str, Any]:
+        result = {key: state.get(key) for key in (
+            "answer", "usage", "citations", "verification", "claim_evidence_map", "answer_mode",
+            "booking_draft", "approval_form", "policy_constraints", "policy_validation",
+            "risk_level", "rag_correction_count", "travel_retry_exhausted",
+            "rag_evidence", "rag_stages", "human_review",
+        )}
+        inventory_issue = LangGraphTravelOrchestrator._inventory_issue(state)
+        travel_workflow = task["intent"] in {
+            TravelIntent.TRIP_PLANNING.value,
+            TravelIntent.APPLICATION.value,
+            TravelIntent.BOOKING.value,
+        }
+        needs_review = (
+            bool(inventory_issue)
+            or bool(state.get("human_review"))
+            or not state.get("answer")
+            or state.get("risk_level") == "high"
+            or state.get("answer_mode") == "llm_fallback"
+            or (state.get("verification") or {}).get("passed") is False
+            or (state.get("verification") or {}).get("question_answered") is False
+            or (
+                travel_workflow
+                and (state.get("policy_validation") or {}).get("status") in {"failed", "needs_review"}
+            )
+        )
+        result.update({
+            "task_id": task["id"], "intent": task["intent"], "request": task["request"],
+            "status": "needs_review" if needs_review else "completed",
+            "tool_trace": [{**item, "task_id": task["id"]} for item in state.get("tool_trace") or []],
+            "trace": [{**item, "task_id": task["id"]} for item in state.get("trace") or []],
+        })
+        return result
+
+    @staticmethod
+    def _inventory_issue(state: TravelGraphState) -> str | None:
+        expected = {
+            TravelIntent.SEARCH_FLIGHT.value: ("search_flights", "flight"),
+            TravelIntent.SEARCH_HOTEL.value: ("search_hotels", "hotel"),
+            TravelIntent.SEARCH_TRAIN.value: ("search_trains", "train"),
+        }.get(state.get("intent"))
+        if expected is None:
+            return None
+        tool_name, mode = expected
+        for item in LangGraphTravelOrchestrator._current_attempt_tool_trace(state):
+            if item.get("tool") != tool_name:
+                continue
+            try:
+                payload = json.loads(item.get("output") or "")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(payload, dict) and payload.get("mode") == mode
+                and not payload.get("error") and isinstance(payload.get("results"), list)
+                and any(isinstance(row, dict) for row in payload["results"])
+            ):
+                return None
+        return "当前未能取得可核实的查询结果，不能据此提供库存、价格或余票结论。"
+
+    async def _execute_planned_task(
+        self, state: TravelGraphState, task: dict[str, Any], dependencies: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        result = await self._task_graph.ainvoke(
+            self._task_state(state, task, dependencies),
+            config={"recursion_limit": 20 + 5 * max(0, settings.travel_validation_max_retries)},
+        )
+        return self._task_result(task, result)
+
+    async def _multi_task_executor(
+        self, state: TravelGraphState
+    ) -> Command[Literal["response_finalizer"]]:
+        tasks = state["execution_plan"]["tasks"]
+
+        async def runner(task: dict[str, Any], dependencies: list[dict[str, Any]]) -> dict[str, Any]:
+            return await self._execute_planned_task(state, task, dependencies)
+
+        results = await execute_task_plan(
+            tasks, runner, max_concurrency=settings.task_max_concurrency,
+            timeout_seconds=lambda task: settings.rag_evidence_task_timeout_seconds
+            if task["intent"] in {"policy", "rag"} else settings.task_timeout_seconds,
+        )
+        for result in results:
+            if result.get("status") == "failed" and result.get("intent") in {"policy", "rag", "info_query"}:
+                result["human_review"] = prepare_review({
+                    "messages": state["messages"], "conversation_messages": state.get("conversation_messages"),
+                    "rag_task_request": result["request"], "active_task": {"id": result["task_id"]},
+                    "verification": {"passed": False, "stage": "task_execution", "question_answered": False},
+                }, result.get("answer") or "自动制度问答任务未完成。")
+                result["status"] = "needs_review"
+                result["answer"] = "【待人工审核】自动制度问答任务未能完成，需人工检查后提供正式答复。"
+        sections: list[str] = []
+        citations: list[dict[str, Any]] = []
+        trace = list(state.get("trace") or [])
+        status_labels = {"completed": "已完成", "needs_review": "需复核", "failed": "失败", "blocked": "未执行"}
+        for index, result in enumerate(results, start=1):
+            # Each child was already verified against its own citations. Renumber only
+            # after verification, keeping claim-evidence maps local to each task.
+            offset = len(citations)
+            local_citations = result.get("citations") or []
+            answer = result.get("answer") or "该任务未返回结果。"
+            if local_citations:
+                answer = re.sub(
+                    r"\[(\d+)\]",
+                    lambda match: f"[{int(match[1]) + offset}]"
+                    if 1 <= int(match[1]) <= len(local_citations) else match[0], answer,
+                )
+                citations.extend({**item, "metadata": {
+                    **(item.get("metadata") or {}), "task_id": result["task_id"],
+                }} for item in local_citations)
+            sections.append(
+                f"{index}. {result['request']}（{status_labels[result['status']]}）\n\n{answer}"
+            )
+            trace.extend(result.get("trace") or [])
+        risk_order = {"low": 0, "medium": 1, "high": 2}
+        return Command(update={
+            "answer": "\n\n".join(sections), "task_results": results, "citations": citations,
+            "usage": self._sum_usage(*(result.get("usage") for result in results)),
+            "tool_trace": [item for result in results for item in result.get("tool_trace") or []],
+            "risk_level": max((result.get("risk_level") or "low" for result in results), key=risk_order.get),
+            "verification": {"scope": "per_task", "tasks": {
+                result["task_id"]: {"status": result["status"], "verification": result.get("verification")}
+                for result in results
+            }},
+            "trace": self._append_trace({**state, "trace": trace}, "multi_task_executor", "completed",
+                                        {"task_count": len(results)}),
+        }, goto="response_finalizer")
 
     def _route_after_answer(
         self, state: TravelGraphState
-    ) -> Literal["reflection_agent", "verification_agent"]:
+    ) -> Literal["response_reviewer", "grounding_verifier"]:
         text = self._last_user_text(state.get("effective_messages") or state["messages"])
         if any(k in text for k in ("反思", "检查一遍", "复核", "挑错")):
-            return "reflection_agent"
-        return "verification_agent"
+            return "response_reviewer"
+        return "grounding_verifier"
 
-    async def _policy_reasoner_agent(
+    async def _policy_reasoner(
         self, state: TravelGraphState
     ) -> Command[Literal["travel_react_agent"]]:
         text = self._last_user_text(state.get("effective_messages") or state["messages"])
@@ -257,21 +591,11 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             "confidence": 0.0,
             "notes": ["未检索到可用制度约束，后续合规校验将要求人工复核。"],
         }
-        store = self._document_store
-        if store is not None and getattr(store, "connected", False):
+        if self._knowledge_retrieval_available():
             try:
                 query = f"{text}\n差旅制度 酒店标准 舱位 提前预订 审批 金额"
-                vector = await EmbeddingService().embed_text(query)
-                hits = store.search(vector, top_k=5)
-                citations = [
-                    {
-                        "title": h.get("title"),
-                        "doc_type": h.get("doc_type"),
-                        "content": str(h.get("content") or "")[:800],
-                        "score": h.get("score"),
-                    }
-                    for h in hits
-                ]
+                hits = await self._retrieve_knowledge(query)
+                citations = [self._citation_from_hit(hit) for hit in hits]
                 constraints = await self._extract_policy_constraints(text, citations, state.get("memory_context", ""))
             except Exception as exc:  # noqa: BLE001
                 constraints = {
@@ -291,130 +615,146 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 "policy_constraints": constraints,
                 "trace": self._append_trace(
                     state,
-                    "policy_reasoner_agent",
+                    "policy_reasoner",
                     "constraints_extracted",
                     {
                         "source": constraints.get("source"),
                         "confidence": constraints.get("confidence"),
                         "citation_count": len(citations),
+                        "retrieval": self._retrieval_trace(citations),
                     },
                 ),
             },
             goto="travel_react_agent",
         )
 
-    async def _rag_agent(
+    async def _rag_responder(
         self, state: TravelGraphState
-    ) -> Command[Literal["reflection_agent", "finalizer_agent"]]:
+    ) -> Command[Literal["rag_evidence_builder", "response_finalizer"]]:
         text = self._last_user_text(state.get("effective_messages") or state["messages"])
-        store = self._document_store
-        if store is None or not getattr(store, "connected", False):
-            answer, usage = await self._llm_fallback_answer(
-                text,
-                reason="知识库当前不可用，未能检索公司制度依据。",
-                memory_context=state.get("memory_context", ""),
-            )
-            update = {
-                "answer": answer,
-                "citations": [],
-                "usage": usage,
-                "risk_level": "medium",
-                "answer_mode": "llm_fallback",
-                "trace": self._append_trace(state, "rag_agent", "knowledge_base_unavailable"),
-            }
-            return Command(update=update, goto=self._route_after_answer({**state, **update}))
-
+        question = self._last_user_text(state.get("conversation_messages") or state["messages"])
+        if not self._knowledge_retrieval_available():
+            return self._rag_failure(state, "retrieval", "knowledge_base_unavailable")
         try:
-            vector = await EmbeddingService().embed_text(text)
-            hits = store.search(vector, top_k=5)
+            hits = await self._retrieve_knowledge(text)
         except Exception as exc:
-            answer, usage = await self._llm_fallback_answer(
-                text,
-                reason=f"知识库检索失败：{exc!s}",
-                memory_context=state.get("memory_context", ""),
-            )
-            update = {
-                "answer": answer,
-                "citations": [],
-                "usage": usage,
-                "risk_level": "medium",
-                "answer_mode": "llm_fallback",
-                "trace": self._append_trace(
-                    state, "rag_agent", "retrieval_failed", {"error": str(exc)}
-                ),
-            }
-            return Command(update=update, goto=self._route_after_answer({**state, **update}))
-
-        citations = [
-            {
-                "title": h.get("title"),
-                "doc_type": h.get("doc_type"),
-                "content": str(h.get("content") or "")[:800],
-                "score": h.get("score"),
-            }
-            for h in hits
-        ]
-        if not self._has_reliable_citations(text, citations):
-            answer, usage = await self._llm_fallback_answer(
-                text,
-                reason="当前知识库未检索到足够相关的公司制度依据。",
-                memory_context=state.get("memory_context", ""),
-            )
-            update = {
-                "answer": answer,
-                "usage": usage,
-                "citations": [],
-                "risk_level": "medium",
-                "answer_mode": "llm_fallback",
-                "trace": self._append_trace(
-                    state, "rag_agent", "fallback_no_reliable_citation", {"hit_count": len(citations)}
-                ),
-            }
-            return Command(update=update, goto=self._route_after_answer({**state, **update}))
-
-        context = "\n\n".join(
-            f"[{i}] 标题：{c.get('title') or '未命名'}\n内容：{c.get('content')}"
-            for i, c in enumerate(citations, start=1)
-        )
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "你是企业差旅制度问答 Agent。只能基于给定参考资料回答；"
-                    "资料不足时明确说明，不要编造制度。回答末尾列出引用编号。"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"{state.get('memory_context', '')}\n\n"
-                    f"参考资料：\n{context or '无'}\n\n用户问题：{text}"
-                ),
-            },
-        ]
-        resp = await self._llm.chat_completion(prompt, temperature=0.1)
+            return self._rag_failure(state, "retrieval", type(exc).__name__, exception=exc)
+        citations = [self._citation_from_hit(hit) for hit in hits]
+        if not citations:
+            return self._rag_failure(state, "retrieval", "no_evidence")
         update = {
-            "answer": resp.choices[0].message.content or "",
-            "usage": self._usage_dict(resp),
-            "citations": citations,
-            "risk_level": "low" if citations else "medium",
-            "answer_mode": "rag_grounded",
+            "citations": citations, "rag_question": question, "rag_task_request": text,
+            "rag_stages": self._rag_stage(state, "retrieval", {"query": text, **self._retrieval_trace(citations)}),
             "trace": self._append_trace(
-                state, "rag_agent", "retrieved", {"hit_count": len(citations)}
+                state, "rag_responder", "retrieved", {"hit_count": len(citations), "retrieval": self._retrieval_trace(citations)},
             ),
         }
-        return Command(update=update, goto=self._route_after_answer({**state, **update}))
+        return Command(update=update, goto="rag_evidence_builder")
+
+    async def _rag_evidence_builder(self, state: TravelGraphState) -> Command[Literal["rag_answer_generator", "response_finalizer"]]:
+        citations = list(state.get("citations") or [])
+        usage = state.get("usage")
+        stages = list(state.get("rag_stages") or [])
+        diagnostics: list[dict[str, Any]] = []
+        try:
+            pack, records, call_usage = await self._evidence_qa.build(
+                state["rag_question"], citations, task_request=state.get("rag_task_request", ""),
+                diagnostics=diagnostics,
+            )
+            usage = self._sum_usage(usage, call_usage)
+            # Every retrieval still uses the configured Top K. Extra queries are bounded
+            # and only fill requirements identified as missing, never loop indefinitely.
+            if any(r.status == "missing" for r in pack.requirements):
+                known = {c["chunk_id"] for c in citations}
+                queries = list(dict.fromkeys(pack.search_queries))[:settings.rag_evidence_max_supplemental_queries]
+                added = False
+                for query in queries:
+                    try:
+                        hits = await self._retrieve_knowledge(query)
+                    except Exception as exc:
+                        stages.append({"stage": "supplemental_retrieval", "query": query, "error": type(exc).__name__})
+                        continue
+                    new = []
+                    for hit in hits:
+                        citation = self._citation_from_hit(hit)
+                        if citation["chunk_id"] not in known:
+                            known.add(citation["chunk_id"])
+                            citations.append(citation)
+                            new.append(citation["chunk_id"])
+                    added = added or bool(new)
+                    stages.append({"stage": "supplemental_retrieval", "query": query, "added_chunk_ids": new})
+                if added:
+                    pack, records, call_usage = await self._evidence_qa.build(
+                        state["rag_question"], citations, task_request=state.get("rag_task_request", ""),
+                        diagnostics=diagnostics,
+                    )
+                    usage = self._sum_usage(usage, call_usage)
+        except Exception as exc:
+            return self._rag_failure({**state, "usage": usage, "citations": citations, "rag_stages": stages}, "evidence", type(exc).__name__, exception=exc, diagnostics=diagnostics)
+        evidence = {"question": state["rag_question"], "task_request": state.get("rag_task_request"), "pack": pack.model_dump(mode="json"), "facts": records}
+        stages.append({"stage": "evidence", "requirements": evidence["pack"]["requirements"], "facts": records, **diagnostic_summary(diagnostics)})
+        return Command(update={
+            "rag_evidence": evidence, "citations": citations, "usage": usage, "rag_stages": stages,
+            "trace": self._append_trace(state, "rag_evidence_builder", "prepared", {"fact_count": len(records)}),
+        }, goto="rag_answer_generator")
+
+    async def _rag_answer_generator(self, state: TravelGraphState) -> Command[Literal["grounding_verifier", "response_finalizer"]]:
+        evidence = state["rag_evidence"]
+        pack = EvidencePack.model_validate(evidence["pack"])
+        diagnostics: list[dict[str, Any]] = []
+        try:
+            draft, usage = await self._evidence_qa.draft(
+                state["rag_question"], pack, evidence["facts"], state["citations"],
+                task_request=state.get("rag_task_request", ""),
+                diagnostics=diagnostics,
+            )
+            answer = render_draft(draft, evidence["facts"], state["citations"])
+        except Exception as exc:
+            return self._rag_failure(state, "draft", type(exc).__name__, exception=exc, diagnostics=diagnostics)
+        return Command(update={
+            "rag_draft": draft.model_dump(mode="json"), "answer": answer, "answer_mode": "rag_grounded",
+            "usage": self._sum_usage(state.get("usage"), usage),
+            "rag_stages": self._rag_stage(state, "draft", {"answer": answer, "claims": draft.model_dump(mode="json")["claims"], **diagnostic_summary(diagnostics)}),
+            "trace": self._append_trace(state, "rag_answer_generator", "drafted"),
+        }, goto="grounding_verifier")
+
+    @staticmethod
+    def _rag_stage(state: TravelGraphState, stage: str, data: dict[str, Any]) -> list[dict[str, Any]]:
+        return [*(state.get("rag_stages") or []), {"stage": stage, **data}]
+
+    def _rag_failure(self, state: TravelGraphState, stage: str, error: str, *, exception: Exception | None = None, diagnostics: list[dict[str, Any]] | None = None) -> Command[Literal["response_finalizer"]]:
+        status = getattr(exception, "status_code", None)
+        detail = {"upstream_status": status} if isinstance(status, int) else {}
+        detail.update(diagnostic_summary(diagnostics or []))
+        if isinstance(exception, EvidenceError):
+            detail["validation_error"] = exception.diagnostic()
+        answer = "当前制度问答处理失败，暂时无法给出经过核验的回答，请稍后重试。"
+        if error == "no_evidence":
+            answer = "当前未检索到该问题的制度依据，请补充相关制度资料或调整问题。"
+        elif error == "knowledge_base_unavailable":
+            answer = "知识库当前不可用，暂时无法检索制度依据，请稍后重试。"
+        elif status == 402:
+            answer = "模型服务返回402（账户余额或计费状态异常），暂时无法完成制度问答，请检查模型服务账户。"
+        return Command(update={
+            "answer": answer,
+            "answer_mode": "llm_fallback", "risk_level": "medium",
+            "verification": {"passed": False, "reason": error, "stage": stage, "claim_evidence_map": [], **detail},
+            "rag_stages": self._rag_stage(state, stage, {"error": error, **detail}),
+            "trace": self._append_trace(state, "rag_" + stage, "failed", {"error": error, **detail}),
+            "usage": self._sum_usage(state.get("usage"), getattr(exception, "usage", None)) if isinstance(exception, EvidenceError) else state.get("usage"), "citations": state.get("citations") or [],
+        }, goto="response_finalizer")
 
     async def _travel_react_agent(
         self, state: TravelGraphState
-    ) -> Command[Literal["policy_validator_agent"]]:
+    ) -> Command[Literal["policy_validator"]]:
         messages = list(state["openai_messages"])
+        attempt = int(state.get("travel_retry_count") or 0) + 1
         if state.get("execution_plan"):
             messages.append(
                 {
                     "role": "system",
-                    "content": "执行计划（由 Planner Agent 生成）：\n"
-                    + json.dumps(state["execution_plan"], ensure_ascii=False),
+                    "content": "执行计划（由 planner 节点生成）：\n"
+                    + json.dumps(state.get("active_task") or state["execution_plan"], ensure_ascii=False),
                 }
             )
         if state.get("policy_constraints"):
@@ -425,7 +765,32 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                     + json.dumps(state["policy_constraints"], ensure_ascii=False),
                 }
             )
+        retry_feedback = state.get("travel_retry_feedback")
+        if attempt > 1 and retry_feedback:
+            max_attempts = max(1, int(settings.travel_validation_max_retries) + 1)
+            attempt_label = "最后一次自动尝试" if attempt >= max_attempts else "自动重试"
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"这是第 {attempt} 次候选生成（{attempt_label}）。"
+                        "上一轮候选未通过校验，必须根据反馈重新调用查询/推荐工具，"
+                        "优先选择满足制度约束且库存、价格信息完整的新候选；不得直接复用上一轮不合规组合。"
+                        "如果仍找不到合适方案，必须明确说明没有合规候选，不得编造库存。\n"
+                        "上一轮校验反馈：\n"
+                        + json.dumps(retry_feedback, ensure_ascii=False)
+                    ),
+                }
+            )
         tools = _travel_tools()
+        search_tools = {
+            TravelIntent.SEARCH_FLIGHT.value: "search_flights",
+            TravelIntent.SEARCH_HOTEL.value: "search_hotels",
+            TravelIntent.SEARCH_TRAIN.value: "search_trains",
+        }
+        if state.get("intent") in search_tools:
+            tools = [tool for tool in tools if tool["function"]["name"] == search_tools[state["intent"]]]
+        allowed_tools = {tool["function"]["name"] for tool in tools}
         tool_trace: list[dict[str, Any]] = list(state.get("tool_trace") or [])
         usage: dict[str, int] | None = None
         user_text = self._last_user_text(state.get("effective_messages") or state["messages"])
@@ -455,12 +820,15 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                     }
                 )
                 for tc in msg.tool_calls:
+                    if tc.function.name not in allowed_tools:
+                        raise ValueError("Tool call does not belong to the current task")
                     output = await self._execute_tool(tc.function.name, tc.function.arguments, user_text)
                     tool_trace.append(
                         {
                             "tool": tc.function.name,
                             "arguments": tc.function.arguments or "{}",
                             "output": output,
+                            "attempt": attempt,
                         }
                     )
                     messages.append(
@@ -476,44 +844,51 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 "answer": msg.content or "",
                 "usage": usage,
                 "tool_trace": tool_trace,
+                "travel_attempt": attempt,
                 "trace": self._append_trace(
                     state,
                     "travel_react_agent",
                     "answered",
-                    {"tool_calls": [t.get("tool") for t in tool_trace]},
+                    {
+                        "attempt": attempt,
+                        "tool_calls": [
+                            t.get("tool")
+                            for t in tool_trace
+                            if not isinstance(t, dict) or t.get("attempt") == attempt
+                        ],
+                    },
                 ),
             }
-            return Command(update=update, goto="policy_validator_agent")
+            return Command(update=update, goto="policy_validator")
 
         update = {
             "answer": "已达到最大推理轮次，请简化问题后重试。",
             "usage": usage,
             "tool_trace": tool_trace,
+            "travel_attempt": attempt,
             "risk_level": "medium",
-            "trace": self._append_trace(state, "travel_react_agent", "max_iterations"),
+            "trace": self._append_trace(
+                state,
+                "travel_react_agent",
+                "max_iterations",
+                {"attempt": attempt},
+            ),
         }
-        return Command(update=update, goto="policy_validator_agent")
+        return Command(update=update, goto="policy_validator")
 
-    async def _policy_validator_agent(
+    async def _policy_validator(
         self, state: TravelGraphState
-    ) -> Command[Literal["approval_agent"]]:
+    ) -> Command[Literal["travel_retry_router"]]:
         draft = self._build_booking_draft(state)
         validation = self._build_policy_validation(state, draft)
-        risk_level = state.get("risk_level") or "low"
-        if validation.get("status") in {"failed", "needs_review"}:
-            risk_level = "high" if validation.get("violations") else "medium"
-        answer = state.get("answer", "")
-        if validation.get("summary") and validation.get("status") != "passed":
-            answer = f"{answer}\n\n合规校验：{validation['summary']}"
+        validation["attempt"] = int(state.get("travel_attempt") or 1)
         return Command(
             update={
-                "answer": answer,
                 "booking_draft": draft,
                 "policy_validation": validation,
-                "risk_level": risk_level,
                 "trace": self._append_trace(
                     state,
-                    "policy_validator_agent",
+                    "policy_validator",
                     validation.get("status", "checked"),
                     {
                         "violations": len(validation.get("violations") or []),
@@ -521,14 +896,131 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                     },
                 ),
             },
-            goto="approval_agent",
+            goto="travel_retry_router",
         )
 
-    async def _approval_agent(
+    async def _travel_retry_router(
         self, state: TravelGraphState
-    ) -> Command[Literal["reflection_agent", "finalizer_agent"]]:
+    ) -> Command[Literal["travel_react_agent", "approval_processor"]]:
+        validation = state.get("policy_validation") or {}
+        status = str(validation.get("status") or "needs_review")
+        retry_count = int(state.get("travel_retry_count") or 0)
+        max_retries = max(0, int(settings.travel_validation_max_retries))
+        retry_reasons = self._travel_retry_reasons(
+            state,
+            state.get("booking_draft"),
+            validation,
+        )
+
+        if status == "passed" and not retry_reasons:
+            return Command(
+                update={
+                    "travel_retry_feedback": None,
+                    "travel_retry_exhausted": False,
+                    "trace": self._append_trace(
+                        state,
+                        "travel_retry_router",
+                        "validation_passed",
+                        {"attempt": state.get("travel_attempt", 1)},
+                    ),
+                },
+                goto="approval_processor",
+            )
+
+        if retry_reasons and retry_count < max_retries:
+            next_retry_count = retry_count + 1
+            feedback = {
+                "previous_attempt": state.get("travel_attempt", retry_count + 1),
+                "validation_status": status,
+                "reasons": retry_reasons,
+                "violations": validation.get("violations") or [],
+                "warnings": validation.get("warnings") or [],
+            }
+            return Command(
+                update={
+                    "travel_retry_count": next_retry_count,
+                    "travel_retry_feedback": feedback,
+                    "travel_retry_exhausted": False,
+                    "trace": self._append_trace(
+                        state,
+                        "travel_retry_router",
+                        "retry_scheduled",
+                        {
+                            "retry": next_retry_count,
+                            "max_retries": max_retries,
+                            "reasons": retry_reasons,
+                        },
+                    ),
+                },
+                goto="travel_react_agent",
+            )
+
+        exhausted = bool(retry_reasons and retry_count >= max_retries and retry_count > 0)
+        answer = state.get("answer", "")
+        summary = validation.get("summary")
+        if summary:
+            answer = f"{answer}\n\n合规校验：{summary}"
+        if exhausted:
+            answer = (
+                f"{answer}\n\n自动重试：已完成 {retry_count} 次合规重试，仍未找到满足当前约束的完整方案，"
+                "已停止自动尝试并转人工审核。"
+            )
+        validation = dict(validation)
+        if retry_reasons and status == "passed":
+            status = "needs_review"
+            validation["status"] = status
+            validation["summary"] = "候选完整性检查未通过，自动重试后仍需人工复核。"
+        validation["retry"] = {
+            "count": retry_count,
+            "max_retries": max_retries,
+            "exhausted": exhausted,
+            "reasons": retry_reasons,
+        }
+        manual_review_required = bool(
+            exhausted
+            or status == "failed"
+            or (state.get("booking_draft") is not None and status == "needs_review")
+        )
+        return Command(
+            update={
+                "answer": answer,
+                "policy_validation": validation,
+                "risk_level": "high" if manual_review_required else "medium",
+                "travel_retry_exhausted": exhausted,
+                "travel_retry_feedback": {
+                    "validation_status": status,
+                    "reasons": retry_reasons,
+                    "violations": validation.get("violations") or [],
+                    "warnings": validation.get("warnings") or [],
+                },
+                "trace": self._append_trace(
+                    state,
+                    "travel_retry_router",
+                    "retry_exhausted" if exhausted else "manual_review_required",
+                    {
+                        "retry_count": retry_count,
+                        "max_retries": max_retries,
+                        "status": status,
+                        "reasons": retry_reasons,
+                    },
+                ),
+            },
+            goto="approval_processor",
+        )
+
+    async def _approval_processor(
+        self, state: TravelGraphState
+    ) -> Command[Literal["response_reviewer", "grounding_verifier"]]:
         draft = state.get("booking_draft") or self._build_booking_draft(state)
         form = self._build_approval_form(state, draft)
+        validation = state.get("policy_validation") or {}
+        force_manual_review = bool(
+            state.get("travel_retry_exhausted")
+            or validation.get("status") == "failed"
+            or (draft is not None and validation.get("status") == "needs_review")
+        )
+        if force_manual_review:
+            form = self._force_manual_review_form(state, form, draft, validation)
         answer = state.get("answer", "")
         risk_level = "high" if form and form.get("required") else state.get("risk_level") or "low"
         if draft:
@@ -548,53 +1040,129 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             "risk_level": risk_level,
             "trace": self._append_trace(
                 state,
-                "approval_agent",
+                "approval_processor",
                 "approval_required" if form and form.get("required") else "not_required",
             ),
         }
         return Command(update=update, goto=self._route_after_answer({**state, **update}))
 
-    async def _verification_agent(self, state: TravelGraphState) -> dict[str, Any]:
-        answer = state.get("answer", "")
-        citations = state.get("citations") or []
-        answer_mode = state.get("answer_mode")
-        verification = self._verify_answer_grounding(answer, citations, answer_mode)
-        updated_answer = answer
-        risk_level = state.get("risk_level") or "low"
-        mode = answer_mode
-        if not verification["passed"]:
-            risk_level = "high"
-            mode = "llm_fallback"
-            unsupported = "；".join(verification["unsupported_terms"])
-            updated_answer = (
-                f"{answer}\n\n核验提示：以下关键信息未能从当前引用资料中确认：{unsupported}。"
-                "请以公司制度或人工审批为准。"
+    async def _grounding_verifier(
+        self, state: TravelGraphState
+    ) -> Command[Literal["rag_self_corrector", "response_finalizer"]]:
+        if state.get("answer_mode") != "rag_grounded":
+            return Command(update={"verification": {"passed": None, "reason": "not_applicable", "status": "skipped", "claim_evidence_map": []}}, goto="response_finalizer")
+        evidence, raw_draft = state.get("rag_evidence"), state.get("rag_draft")
+        if not evidence or not raw_draft:
+            return self._rag_failure(state, "verification", "missing_evidence_state")
+        diagnostics: list[dict[str, Any]] = []
+        try:
+            verification, usage = await self._evidence_qa.review(
+                state["rag_question"], EvidencePack.model_validate(evidence["pack"]), evidence["facts"],
+                AnswerDraft.model_validate(raw_draft), state.get("citations") or [],
+                task_request=state.get("rag_task_request", ""),
+                diagnostics=diagnostics,
             )
-        return {
-            "answer": updated_answer,
-            "risk_level": risk_level,
-            "answer_mode": mode,
+        except Exception as exc:
+            return self._rag_verified_subset(state, "verification_unavailable:" + type(exc).__name__, exception=exc, diagnostics=diagnostics)
+        update: dict[str, Any] = {
             "verification": verification,
+            "claim_evidence_map": verification.get("claim_evidence_map") or [],
+            "usage": self._sum_usage(state.get("usage"), usage),
+            "rag_stages": self._rag_stage(state, "verification", {"attempt": int(state.get("rag_correction_count") or 0), **verification, **diagnostic_summary(diagnostics)}),
             "trace": self._append_trace(
                 state,
-                "verification_agent",
+                "grounding_verifier",
                 "passed" if verification["passed"] else "flagged",
-                {"unsupported_count": len(verification["unsupported_terms"])},
+                {
+                    "failed_claim_count": sum(c["status"] != "supported" for c in verification["claim_evidence_map"]),
+                    "correction_count": int(state.get("rag_correction_count") or 0),
+                },
             ),
         }
+        if verification["passed"]:
+            update["risk_level"] = "low" if verification["question_answered"] else "medium"
+            return Command(update=update, goto="response_finalizer")
+        correction_count = int(state.get("rag_correction_count") or 0)
+        if correction_count < 1:
+            update["risk_level"] = "medium"
+            return Command(update=update, goto="rag_self_corrector")
+        command = self._rag_verified_subset({**state, **update}, "correction_exhausted")
+        return Command(update={**update, **command.update}, goto="response_finalizer")
 
-    async def _general_agent(
+    def _rag_verified_subset(self, state: TravelGraphState, reason: str, *, exception: Exception | None = None, diagnostics: list[dict[str, Any]] | None = None) -> Command[Literal["response_finalizer"]]:
+        """Retain only reviewed claims; failed claims never appear in user-facing fallback."""
+        mapping = (state.get("verification") or {}).get("claim_evidence_map") or []
+        supported = {c["claim_id"] for c in mapping if c.get("status") == "supported"}
+        evidence, raw = state.get("rag_evidence"), state.get("rag_draft")
+        kept = [c for c in (raw or {}).get("claims", []) if c["id"] in supported]
+        answer = "当前未能完成全部结论核验，暂时无法提供完整答复。请稍后重试或补充适用条件。"
+        status = getattr(exception, "status_code", None)
+        detail = {"upstream_status": status} if isinstance(status, int) else {}
+        detail.update(diagnostic_summary(diagnostics or []))
+        if isinstance(exception, EvidenceError):
+            detail["validation_error"] = exception.diagnostic()
+        if status == 402:
+            answer = "模型服务返回402（账户余额或计费状态异常），暂时无法完成全部结论核验，请检查模型服务账户。"
+        if kept and evidence:
+            answer = render_draft(AnswerDraft(claims=kept), evidence["facts"], state.get("citations") or []) + "\n\n" + answer
+        final_map = [c for c in mapping if c.get("claim_id") in supported]
+        verification = {
+            **(state.get("verification") or {}), "passed": bool(kept), "reason": reason,
+            "question_answered": False, "claim_evidence_map": final_map,
+            "finalization": "supported_claims_only" if kept else "no_verified_claims",
+            **detail,
+        }
+        return Command(update={
+            "answer": answer, "answer_mode": "rag_grounded" if kept else "llm_fallback",
+            "risk_level": "medium", "verification": verification, "claim_evidence_map": final_map,
+            "rag_stages": self._rag_stage(state, "finalization", {"reason": reason, "kept_claim_ids": sorted(supported), **detail}),
+            "usage": self._sum_usage(state.get("usage"), getattr(exception, "usage", None)) if isinstance(exception, EvidenceError) else state.get("usage"),
+        }, goto="response_finalizer")
+
+    async def _general_responder(
         self, state: TravelGraphState
-    ) -> Command[Literal["reflection_agent", "finalizer_agent"]]:
+    ) -> Command[Literal["response_reviewer", "grounding_verifier"]]:
         resp = await self._llm.chat_completion(state["openai_messages"], temperature=0.2)
         update = {
             "answer": resp.choices[0].message.content or "",
             "usage": self._usage_dict(resp),
-            "trace": self._append_trace(state, "general_agent", "answered"),
+            "trace": self._append_trace(state, "general_responder", "answered"),
         }
         return Command(update=update, goto=self._route_after_answer({**state, **update}))
 
-    async def _reflection_agent(self, state: TravelGraphState) -> dict[str, Any]:
+    async def _rag_self_corrector(
+        self, state: TravelGraphState
+    ) -> Command[Literal["grounding_verifier", "response_finalizer"]]:
+        evidence = state["rag_evidence"]
+        diagnostics: list[dict[str, Any]] = []
+        try:
+            draft, usage = await self._evidence_qa.correct(
+                state["rag_question"], EvidencePack.model_validate(evidence["pack"]), evidence["facts"],
+                AnswerDraft.model_validate(state["rag_draft"]), state["verification"], state.get("citations") or [],
+                task_request=state.get("rag_task_request", ""),
+                diagnostics=diagnostics,
+            )
+            corrected = render_draft(draft, evidence["facts"], state.get("citations") or [])
+        except Exception as exc:
+            return self._rag_verified_subset(state, "correction_failed:" + type(exc).__name__, exception=exc, diagnostics=diagnostics)
+        correction_count = int(state.get("rag_correction_count") or 0) + 1
+        return Command(
+            update={
+                "answer": corrected, "rag_draft": draft.model_dump(mode="json"), "rag_correction_count": correction_count,
+                "usage": self._sum_usage(state.get("usage"), usage),
+                "rag_stages": self._rag_stage(state, "correction", {"answer": corrected, "claims": draft.model_dump(mode="json")["claims"], **diagnostic_summary(diagnostics)}),
+                "trace": self._append_trace(
+                    state, "rag_self_corrector", "corrected", {"correction_count": correction_count},
+                ),
+            },
+            goto="grounding_verifier",
+        )
+
+    async def _response_reviewer(
+        self, state: TravelGraphState
+    ) -> Command[Literal["grounding_verifier"]]:
+        if state.get("rag_evidence"):
+            return Command(update={"reflection_notes": "evidence_review_delegated"}, goto="grounding_verifier")
         answer = state.get("answer", "")
         prompt = [
             {
@@ -608,51 +1176,89 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         ]
         resp = await self._llm.chat_completion(prompt, temperature=0.0)
         revised = resp.choices[0].message.content or answer
-        return {
-            "answer": revised,
-            "reflection_notes": "reflection_agent_applied",
-            "usage": self._usage_dict(resp),
-            "trace": self._append_trace(state, "reflection_agent", "revised"),
-        }
-
-    async def _finalizer_agent(self, state: TravelGraphState) -> dict[str, Any]:
-        answer = self._enforce_enterprise_answer_contract(
-            state.get("answer", ""),
-            state.get("tool_trace") or [],
-            state.get("effective_messages", state["messages"]),
+        return Command(
+            update={
+                "answer": revised,
+                "reflection_notes": "response_reviewer_applied",
+                "usage": self._usage_dict(resp),
+                "trace": self._append_trace(state, "response_reviewer", "revised"),
+            },
+            goto="grounding_verifier",
         )
+
+    async def _response_finalizer(self, state: TravelGraphState) -> dict[str, Any]:
+        answer = state.get("answer", "")
+        if state.get("route") not in {"multi_task", "clarification"}:
+            finished = await self._finish_task(state)
+            state = {**state, "answer": finished["answer"], "human_review": finished["human_review"]}
+            answer = state["answer"]
         session_id = state.get("session_id")
         booking_draft = state.get("booking_draft")
         if session_id:
             await self._save_session_messages(
                 session_id,
-                state.get("effective_messages", state["messages"])
+                (state.get("conversation_messages") or state.get("effective_messages", state["messages"]))
                 + [ChatMessage(role=MessageRole.ASSISTANT, content=answer)],
             )
         if booking_draft:
             await self._save_booking_draft(session_id, booking_draft)
+        human_reviews = []
+        # Publish only after the pending response is in history. Children prepare
+        # snapshots; the parent stores tickets once, without leaking private snapshots.
+        for container in [state, *(state.get("task_results") or [])]:
+            prepared = container.get("human_review")
+            if not prepared:
+                continue
+            try:
+                summary = await HumanReviewStore(self._redis).create(session_id or "", prepared)
+            except Exception:
+                summary = {"review_id": None, "status": "submission_failed", "reasons": prepared["reasons"], "task_id": prepared.get("task_id")}
+                answer += "\n\n人工审核单提交失败，当前审核队列不可用，请联系制度负责人；尚未形成最终答复。"
+            container["human_review"] = summary
+            human_reviews.append(summary)
+        if human_reviews and any(item["status"] == "submission_failed" for item in human_reviews) and session_id:
+            await self._save_session_messages(session_id, (state.get("conversation_messages") or state.get("effective_messages", state["messages"])) + [ChatMessage(role=MessageRole.ASSISTANT, content=answer)])
+        for result in state.get("task_results") or []:
+            if result.get("booking_draft"):
+                # Each draft is addressable by id; do not arbitrarily choose a "latest"
+                # draft for a conversation containing several independent plans.
+                await self._save_booking_draft(None, result["booking_draft"])
         return {
             "response": {
                 "id": str(uuid.uuid4()),
                 "created": int(time.time()),
                 "model": self._llm.model,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": answer}}],
-                "usage": state.get("usage"),
+                "usage": self._sum_usage(state.get("planner_usage"), state.get("usage")),
                 "metadata": {
                     "orchestrator": "langgraph",
                     "intent": state.get("intent"),
+                    "route": state.get("route"),
+                    "task_results": state.get("task_results") or [],
                     "tool_trace": state.get("tool_trace") or [],
                     "execution_plan": state.get("execution_plan"),
                     "policy_constraints": state.get("policy_constraints"),
                     "policy_validation": state.get("policy_validation"),
+                    "travel_retry": {
+                        "attempts": state.get("travel_attempt", 0),
+                        "retry_count": state.get("travel_retry_count", 0),
+                        "exhausted": bool(state.get("travel_retry_exhausted")),
+                        "feedback": state.get("travel_retry_feedback"),
+                    },
                     "reflection": state.get("reflection_notes"),
-                    "trace": self._append_trace(state, "finalizer_agent", "completed"),
+                    "trace": self._append_trace(state, "response_finalizer", "completed"),
                     "citations": state.get("citations") or [],
                     "approval_form": state.get("approval_form"),
                     "booking_draft": booking_draft,
                     "risk_level": state.get("risk_level"),
                     "answer_mode": state.get("answer_mode"),
                     "verification": state.get("verification"),
+                    "claim_evidence_map": state.get("claim_evidence_map") or [],
+                    "rag_correction_count": int(state.get("rag_correction_count") or 0),
+                    "rag_evidence": state.get("rag_evidence"),
+                    "rag_stages": self._rag_stage(state, "final", {"answer": answer, "answer_mode": state.get("answer_mode")}) if state.get("rag_stages") else [],
+                    "human_reviews": human_reviews,
+                    "answer_status": "review_submission_failed" if any(item["status"] == "submission_failed" for item in human_reviews) else "pending_human_review" if human_reviews else "automatic",
                     "memory": {
                         "current_facts": state.get("current_facts") or [],
                         "long_term_count": len(state.get("long_term_memories") or []),
@@ -668,10 +1274,20 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         session_id: str | None = None,
         user_id: str | None = None,
     ) -> dict[str, Any]:
+        session_id = session_id or str(uuid.uuid4())
         result = await self._graph.ainvoke(
-            {"messages": messages, "session_id": session_id, "user_id": user_id}
+            {"messages": messages, "session_id": session_id, "user_id": user_id},
+            config={"recursion_limit": 30 + 5 * max(0, settings.travel_validation_max_retries)},
         )
+        result["response"]["session_id"] = session_id
         return result["response"]
+
+    async def stream_completion(self, messages: list[ChatMessage], *, session_id: str | None = None, user_id: str | None = None):
+        result = await self.run_completion(messages, session_id=session_id, user_id=user_id)
+        text = result["choices"][0]["message"]["content"]
+        for index, character in enumerate(text):
+            yield StreamChunk(type=StreamChunkType.CONTENT, index=index, delta=character)
+        yield StreamChunk(type=StreamChunkType.DONE, index=len(text), finish_reason="stop", session_id=result["session_id"], human_reviews=result["metadata"].get("human_reviews") or [], answer_status=result["metadata"].get("answer_status"))
 
     async def _save_booking_draft(
         self,
@@ -794,91 +1410,6 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             return {}
         return value if isinstance(value, dict) else {}
 
-    @staticmethod
-    def _coerce_execution_plan(raw: dict[str, Any], user_text: str) -> dict[str, Any]:
-        fallback = LangGraphTravelOrchestrator._fallback_execution_plan(user_text)
-        if not raw:
-            return fallback
-        allowed_tools = {
-            "recommend_travel_options",
-            "search_flights",
-            "search_trains",
-            "search_hotels",
-            "check_travel_policy",
-            "rag_policy_lookup",
-        }
-        tools = [
-            str(item)
-            for item in raw.get("required_tools", [])
-            if str(item) in allowed_tools
-        ]
-        if not tools:
-            tools = fallback["required_tools"]
-        steps = raw.get("steps")
-        if not isinstance(steps, list) or not steps:
-            steps = fallback["steps"]
-        normalized_steps: list[dict[str, Any]] = []
-        for index, item in enumerate(steps, start=1):
-            if isinstance(item, dict):
-                tool = str(item.get("tool") or "")
-                normalized_steps.append(
-                    {
-                        "order": int(item.get("order") or index),
-                        "tool": tool if tool in allowed_tools else "",
-                        "reason": str(item.get("reason") or item.get("task") or ""),
-                    }
-                )
-            else:
-                normalized_steps.append({"order": index, "tool": "", "reason": str(item)})
-        slots = raw.get("slots") if isinstance(raw.get("slots"), dict) else fallback["slots"]
-        missing = raw.get("missing_slots") if isinstance(raw.get("missing_slots"), list) else []
-        return {
-            "goal": str(raw.get("goal") or fallback["goal"]),
-            "slots": slots,
-            "required_tools": tools,
-            "missing_slots": [str(item) for item in missing],
-            "steps": normalized_steps,
-            "needs_clarification": bool(raw.get("needs_clarification", False)),
-            "rationale": str(raw.get("rationale") or fallback["rationale"]),
-            "planner": "llm",
-        }
-
-    @staticmethod
-    def _fallback_execution_plan(user_text: str, error: str | None = None) -> dict[str, Any]:
-        tools: list[str] = []
-        steps: list[dict[str, Any]] = []
-        lower = user_text.lower()
-        if any(word in user_text for word in ("政策", "制度", "差标", "报销", "审批", "标准")):
-            tools.append("rag_policy_lookup")
-            steps.append({"order": len(steps) + 1, "tool": "rag_policy_lookup", "reason": "检索企业差旅制度约束"})
-        if any(word in user_text for word in ("航班", "机票", "飞机")):
-            tools.append("search_flights")
-            steps.append({"order": len(steps) + 1, "tool": "search_flights", "reason": "查询航班候选"})
-        if any(word in user_text for word in ("高铁", "火车", "动车", "车次")):
-            tools.append("search_trains")
-            steps.append({"order": len(steps) + 1, "tool": "search_trains", "reason": "查询高铁/火车候选"})
-        if any(word in user_text for word in ("酒店", "住宿")):
-            tools.append("search_hotels")
-            steps.append({"order": len(steps) + 1, "tool": "search_hotels", "reason": "查询酒店候选"})
-        if any(word in user_text for word in ("规划", "推荐", "安排", "出差", "差旅", "booking", "预订")) or "trip" in lower:
-            tools = ["recommend_travel_options"]
-            steps = [{"order": 1, "tool": "recommend_travel_options", "reason": "综合查询交通和酒店并形成推荐组合"}]
-        if not tools:
-            tools = []
-            steps = [{"order": 1, "tool": "", "reason": "直接回答通用问题"}]
-        rationale = "基于关键词兜底生成执行计划"
-        if error:
-            rationale = f"{rationale}；LLM planner 失败：{error}"
-        return {
-            "goal": user_text[:120],
-            "slots": {},
-            "required_tools": tools,
-            "missing_slots": [],
-            "steps": steps,
-            "needs_clarification": False,
-            "rationale": rationale,
-            "planner": "fallback",
-        }
 
     async def _extract_policy_constraints(
         self,
@@ -897,7 +1428,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
             {
                 "role": "system",
                 "content": (
-                    "你是企业差旅制度约束抽取 Agent。只能根据参考资料抽取 JSON，不要编造。"
+                    "你是企业差旅制度约束抽取器。只能根据参考资料抽取 JSON，不要编造。"
                     "输出字段：source, constraints, confidence, notes。constraints 可包含 "
                     "hotel_limit_cny, advance_booking_days, approval_threshold_cny, cabin_limit, train_seat。"
                     "没有依据的字段不要输出。"
@@ -974,197 +1505,207 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 return "预订前需要补充出发日期、出发城市、目的城市和员工职级；当前信息不足，暂不执行预订。"
         return None
 
-    @staticmethod
-    def _is_inventory_or_planning_request(text: str) -> bool:
-        action_words = (
-            "查询",
-            "查一下",
-            "看看",
-            "推荐",
-            "比较",
-            "规划",
-            "安排",
-            "生成行程",
-            "制定行程",
-            "商旅规划",
-            "出差方案",
+    def _knowledge_retrieval_available(self) -> bool:
+        if self._rag_retriever is not None:
+            return bool(getattr(self._rag_retriever, "connected", False))
+        return bool(
+            self._document_store is not None
+            and getattr(self._document_store, "connected", False)
         )
-        inventory_words = (
-            "航班",
-            "机票",
-            "飞机",
-            "高铁",
-            "火车",
-            "动车",
-            "车次",
-            "酒店",
-            "住宿",
-            "北京",
-            "上海",
-            "广州",
-            "深圳",
-            "杭州",
-        )
-        return any(w in text for w in action_words) and any(w in text for w in inventory_words)
 
-    @staticmethod
-    def _should_use_rag(intent: str | None, text: str) -> bool:
-        if LangGraphTravelOrchestrator._is_inventory_or_planning_request(text):
-            return False
-        if intent in {TravelIntent.RAG.value, TravelIntent.INFO_QUERY.value}:
-            return True
-        policy_words = (
-            "制度",
-            "政策",
-            "报销",
-            "标准",
-            "差标",
-            "发票",
-            "审批",
-            "补贴",
-            "舱位",
-            "酒店",
-            "提前",
-            "金额",
-            "预订",
-        )
-        question_indicators = ("几天", "多少", "要求", "标准", "可以", "吗", "是什么", "怎么安排")
-        if any(w in text for w in policy_words) and any(q in text for q in question_indicators):
-            return True
-        action_words = ("规划", "安排", "生成行程", "检查差标", "预订", "下单")
-        return any(w in text for w in policy_words) and not any(w in text for w in action_words)
-
-    async def _llm_fallback_answer(
-        self,
-        text: str,
-        *,
-        reason: str,
-        memory_context: str = "",
-    ) -> tuple[str, dict[str, int]]:
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "你是企业差旅助手。当前没有可靠的公司制度依据时，可以给出通用商旅建议，"
-                    "但必须明确标注“未检索到公司制度依据”，不得把建议表述为公司规定。"
-                    "涉及金额、报销、审批、舱位、酒店标准时，提醒用户以公司制度或人工审批为准。"
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"{memory_context}\n\n原因：{reason}\n\n用户问题：{text}",
-            },
-        ]
-        resp = await self._llm.chat_completion(prompt, temperature=0.2)
-        content = resp.choices[0].message.content or ""
-        if "未检索到公司制度依据" not in content:
-            content = f"未检索到公司制度依据。以下为模型基于通用商旅实践的建议：\n\n{content}"
-        return content, self._usage_dict(resp)
-
-    @staticmethod
-    def _has_reliable_citations(text: str, citations: list[dict[str, Any]]) -> bool:
-        if not citations:
-            return False
-        query_terms = [
-            term
-            for term in (
-                "staff",
-                "高级员工",
-                "高级",
-                "经理",
-                "上海",
-                "济南",
-                "酒店",
-                "舱位",
-                "高铁",
-                "预订",
-                "审批",
-                "报销",
-                "金额",
-                "5000",
-                "7",
+    async def _retrieve_knowledge(self, query: str) -> list[dict[str, Any]]:
+        vector = await EmbeddingService().embed_text(query)
+        if self._rag_retriever is not None:
+            if not getattr(self._rag_retriever, "connected", False):
+                raise RuntimeError("hybrid retrieval dependencies unavailable")
+            return await self._rag_retriever.retrieve(
+                query,
+                vector,
+                keyword_top_k=settings.rag_keyword_top_k,
+                vector_top_k=settings.rag_vector_top_k,
+                rrf_k=settings.rag_rrf_k,
+                candidate_top_k=settings.rag_fused_top_k,
+                final_top_k=settings.rag_final_top_k,
             )
-            if term in text
-        ]
-        if not query_terms:
-            return True
-        combined = "\n".join(
-            f"{item.get('title') or ''}\n{item.get('content') or ''}" for item in citations[:3]
-        )
-        specificity_terms = [
-            term for term in query_terms if term not in {"酒店", "舱位", "预订", "审批", "报销", "金额"}
-        ]
-        terms_to_check = specificity_terms or query_terms
-        return any(term in combined for term in terms_to_check)
+        if self._document_store is None or not getattr(self._document_store, "connected", False):
+            raise RuntimeError("knowledge retrieval unavailable")
+        return self._document_store.search(vector, top_k=settings.rag_final_top_k)
 
     @staticmethod
-    def _verify_answer_grounding(
-        answer: str,
-        citations: list[dict[str, Any]],
-        answer_mode: str | None,
-    ) -> dict[str, Any]:
-        if answer_mode != "rag_grounded":
-            return {
-                "passed": True,
-                "reason": "non_rag_answer",
-                "checked_terms": [],
-                "unsupported_terms": [],
-            }
-        citation_text = "\n".join(
-            f"{item.get('title') or ''}\n{item.get('content') or ''}" for item in citations
-        )
-        checked_terms = LangGraphTravelOrchestrator._extract_verifiable_terms(answer)
-        unsupported = [term for term in checked_terms if term not in citation_text]
+    def _citation_from_hit(hit: dict[str, Any]) -> dict[str, Any]:
+        score = hit.get("rerank_score")
+        if score is None:
+            score = hit.get("rrf_score", hit.get("score"))
         return {
-            "passed": not unsupported,
-            "reason": "all_terms_supported" if not unsupported else "unsupported_terms_found",
-            "checked_terms": checked_terms,
-            "unsupported_terms": unsupported,
+            "chunk_id": str(hit.get("chunk_id") or hit.get("id") or "") or None,
+            "title": hit.get("title"),
+            "doc_type": hit.get("doc_type"),
+            "content": str(hit.get("content") or hit.get("text") or "")[:settings.rag_evidence_chunk_max_chars],
+            "score": score,
+            "vector_score": hit.get("vector_score"),
+            "keyword_score": hit.get("keyword_score"),
+            "rrf_score": hit.get("rrf_score"),
+            "rerank_score": hit.get("rerank_score"),
+            "vector_rank": hit.get("vector_rank"),
+            "keyword_rank": hit.get("keyword_rank"),
+            "metadata": dict(hit.get("metadata") or {}),
         }
 
     @staticmethod
-    def _extract_verifiable_terms(text: str) -> list[str]:
-        terms: list[str] = []
-        patterns = [
-            r"\b\d+(?:\.\d+)?\s*CNY\b",
-            r"\b\d+(?:\.\d+)?\s*元\b",
-            r"\b\d+\s*天\b",
-            r"\b\d+\s*晚\b",
+    def _retrieval_trace(citations: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "keyword_top_k": settings.rag_keyword_top_k,
+            "vector_top_k": settings.rag_vector_top_k,
+            "rrf_k": settings.rag_rrf_k,
+            "candidate_top_k": settings.rag_fused_top_k,
+            "final_top_k": settings.rag_final_top_k,
+            "results": [
+                {
+                    "chunk_id": item.get("chunk_id"),
+                    "vector_rank": item.get("vector_rank"),
+                    "keyword_rank": item.get("keyword_rank"),
+                    "rrf_score": item.get("rrf_score"),
+                    "rerank_score": item.get("rerank_score"),
+                }
+                for item in citations
+            ],
+        }
+
+    @staticmethod
+    def _current_attempt_tool_trace(state: TravelGraphState) -> list[dict[str, Any]]:
+        tool_trace = [item for item in state.get("tool_trace") or [] if isinstance(item, dict)]
+        if not any("attempt" in item for item in tool_trace):
+            return tool_trace
+        attempt = int(state.get("travel_attempt") or 1)
+        return [item for item in tool_trace if item.get("attempt") == attempt]
+
+    @staticmethod
+    def _travel_retry_reasons(
+        state: TravelGraphState,
+        booking_draft: dict[str, Any] | None,
+        validation: dict[str, Any],
+    ) -> list[str]:
+        reasons: list[str] = []
+
+        def add(reason: str) -> None:
+            text = reason.strip()
+            if text and text not in reasons:
+                reasons.append(text)
+
+        tool_trace = LangGraphTravelOrchestrator._current_attempt_tool_trace(state)
+        if not tool_trace:
+            add("本轮未执行任何旅行查询或推荐工具，无法形成可校验候选")
+
+        for item in tool_trace:
+            tool_name = str(item.get("tool") or "")
+            output = item.get("output")
+            if not isinstance(output, str):
+                if tool_name.startswith("search_") or tool_name == "recommend_travel_options":
+                    add(f"{tool_name} 未返回可解析结果")
+                continue
+            try:
+                payload = json.loads(output)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            mode = str(payload.get("mode") or "")
+            if payload.get("error"):
+                add(f"{tool_name or mode} 查询失败：{payload['error']}")
+            if mode in {"flight", "hotel", "train"}:
+                results = payload.get("results")
+                if not isinstance(results, list) or not any(
+                    isinstance(row, dict) for row in results
+                ):
+                    add(f"{mode} 查询未找到可用候选")
+            elif mode == "travel_recommendation":
+                flights = [row for row in payload.get("flights") or [] if isinstance(row, dict)]
+                trains = [row for row in payload.get("trains") or [] if isinstance(row, dict)]
+                hotels = [row for row in payload.get("hotels") or [] if isinstance(row, dict)]
+                raw_query = payload.get("query")
+                query: dict[str, Any] = dict(raw_query) if isinstance(raw_query, dict) else {}
+                include_trains = bool(query.get("include_trains", True))
+                if not flights and (not include_trains or not trains):
+                    add("综合推荐未找到可用的航班或火车交通候选")
+                if not hotels:
+                    add("综合推荐未找到可用酒店候选")
+
+        retryable_checks = {"酒店差标", "航班舱位", "高铁/火车席别"}
+        for check in validation.get("checks") or []:
+            if not isinstance(check, dict):
+                continue
+            name = str(check.get("name") or "")
+            status = str(check.get("status") or "")
+            detail = str(check.get("detail") or "")
+            if name in retryable_checks and status in {"failed", "unknown"}:
+                add(detail or f"{name}未通过")
+            elif name == "审批阈值" and status == "unknown" and booking_draft:
+                add(detail or "候选价格不完整，无法校验审批阈值")
+        for violation in validation.get("violations") or []:
+            text = str(violation).strip()
+            if any(keyword in text for keyword in ("酒店", "舱位", "席别", "超出差标", "超过差标", "不符合")):
+                add(text)
+        return reasons
+
+    @staticmethod
+    def _force_manual_review_form(
+        state: TravelGraphState,
+        form: dict[str, Any] | None,
+        booking_draft: dict[str, Any] | None,
+        validation: dict[str, Any],
+    ) -> dict[str, Any]:
+        draft = booking_draft or {}
+        slots_payload = state.get("active_task") or state.get("execution_plan") or {}
+        slots = slots_payload.get("slots") if isinstance(slots_payload, dict) else {}
+        slots = slots if isinstance(slots, dict) else {}
+        result = dict(form or {})
+        warnings = [
+            str(item)
+            for item in result.get("policy_warnings") or []
+            if str(item).strip()
         ]
-        for pattern in patterns:
-            for match in re.finditer(pattern, text, re.IGNORECASE):
-                value = re.sub(r"\s+", " ", match.group(0)).strip()
-                if value not in terms:
-                    terms.append(value)
-        keywords = (
-            "staff",
-            "manager",
-            "director",
-            "executive",
-            "高级员工",
-            "经济舱",
-            "商务舱",
-            "一等座",
-            "二等座",
-            "审批",
-            "特批",
-            "上海",
-            "济南",
-            "北京",
-            "酒店",
-            "高铁",
+        for item in [*(validation.get("violations") or []), *(validation.get("warnings") or [])]:
+            text = str(item).strip()
+            if text and text not in warnings:
+                warnings.append(text)
+        if state.get("travel_retry_exhausted"):
+            text = "自动合规重试已耗尽，仍未找到满足当前约束的完整方案"
+            if text not in warnings:
+                warnings.append(text)
+        result.update(
+            {
+                "required": True,
+                "status": "pending_human_approval",
+                "employee_id": result.get("employee_id")
+                or draft.get("employee_id")
+                or slots.get("employee_id"),
+                "grade": result.get("grade") or draft.get("grade") or slots.get("grade"),
+                "origin_city": result.get("origin_city")
+                or draft.get("origin_city")
+                or slots.get("origin_city"),
+                "destination_city": result.get("destination_city")
+                or draft.get("destination_city")
+                or slots.get("destination_city"),
+                "departure_date": result.get("departure_date")
+                or draft.get("departure_date")
+                or slots.get("departure_date"),
+                "return_date": result.get("return_date")
+                or draft.get("return_date")
+                or slots.get("return_date"),
+                "estimated_total_cny": result.get("estimated_total_cny")
+                or draft.get("estimated_total_cny"),
+                "reason": result.get("reason") or draft.get("purpose") or slots.get("purpose"),
+                "policy_warnings": warnings,
+            }
         )
-        for keyword in keywords:
-            if keyword in text and keyword not in terms:
-                terms.append(keyword)
-        return terms
+        return result
 
     @staticmethod
     def _build_approval_form(
         state: TravelGraphState,
         booking_draft: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        tool_trace = state.get("tool_trace") or []
+        tool_trace = LangGraphTravelOrchestrator._current_attempt_tool_trace(state)
         if not tool_trace:
             return None
         args: dict[str, Any] = {}
@@ -1222,7 +1763,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
 
     @staticmethod
     def _build_booking_draft(state: TravelGraphState) -> dict[str, Any] | None:
-        tool_trace = state.get("tool_trace") or []
+        tool_trace = LangGraphTravelOrchestrator._current_attempt_tool_trace(state)
         if not tool_trace:
             return None
 
@@ -1536,7 +2077,7 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
         elif draft and advance_days:
             add_check("提前预订", "unknown", "缺少出发日期，无法校验提前预订要求")
 
-        for item in state.get("tool_trace") or []:
+        for item in LangGraphTravelOrchestrator._current_attempt_tool_trace(state):
             if not isinstance(item, dict) or not isinstance(item.get("output"), str):
                 continue
             for warning in LangGraphTravelOrchestrator._extract_policy_warnings(item["output"]):
@@ -1591,6 +2132,14 @@ class LangGraphTravelOrchestrator(TravelOrchestrator):
                 if line.strip().startswith("-")
             ]
         return []
+
+    @staticmethod
+    def _sum_usage(*items: dict[str, int] | None) -> dict[str, int] | None:
+        values = [item for item in items if item is not None]
+        if not values:
+            return None
+        return {key: sum(item.get(key, 0) or 0 for item in values)
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
 
     @staticmethod
     def _usage_dict(resp: Any) -> dict[str, int]:

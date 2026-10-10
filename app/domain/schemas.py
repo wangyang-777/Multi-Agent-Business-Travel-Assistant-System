@@ -42,10 +42,18 @@ class ResponseTable(BaseModel):
 
 
 class ResponseCitation(BaseModel):
+    chunk_id: Optional[str] = None
     title: Optional[str] = None
     doc_type: Optional[str] = None
     content: str
     score: Optional[float] = None
+    vector_score: Optional[float] = None
+    keyword_score: Optional[float] = None
+    rrf_score: Optional[float] = None
+    rerank_score: Optional[float] = None
+    vector_rank: Optional[int] = None
+    keyword_rank: Optional[int] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ApprovalForm(BaseModel):
@@ -86,6 +94,27 @@ class BookingDraft(BaseModel):
     expires_at: str
 
 
+class TaskResult(BaseModel):
+    task_id: str
+    intent: str
+    request: str
+    status: Literal["completed", "needs_review", "failed", "blocked"]
+    answer: str = ""
+    citations: list[ResponseCitation] = Field(default_factory=list)
+    tool_trace: list[dict[str, Any]] = Field(default_factory=list)
+    verification: dict[str, Any] | None = None
+    claim_evidence_map: list[dict[str, Any]] = Field(default_factory=list)
+    rag_evidence: dict[str, Any] | None = None
+    rag_stages: list[dict[str, Any]] = Field(default_factory=list)
+    booking_draft: BookingDraft | None = None
+    approval_form: ApprovalForm | None = None
+    policy_constraints: dict[str, Any] | None = None
+    policy_validation: dict[str, Any] | None = None
+    risk_level: Literal["low", "medium", "high"] | None = None
+    usage: dict[str, int] | None = None
+    human_review: dict[str, Any] | None = None
+
+
 class ChatResponse(BaseModel):
     id: str
     object: Literal["chat.completion"] = "chat.completion"
@@ -100,12 +129,22 @@ class ChatResponse(BaseModel):
     approval_form: Optional[ApprovalForm] = None
     booking_draft: Optional[BookingDraft] = None
     execution_plan: Optional[dict[str, Any]] = None
+    route: str | None = None
+    intent: str | None = None
+    task_results: list[TaskResult] = Field(default_factory=list)
     policy_constraints: Optional[dict[str, Any]] = None
     policy_validation: Optional[dict[str, Any]] = None
+    travel_retry: Optional[dict[str, Any]] = None
     trace: list[dict[str, Any]] = Field(default_factory=list)
     risk_level: Optional[Literal["low", "medium", "high"]] = None
     answer_mode: Optional[Literal["rag_grounded", "llm_fallback"]] = None
     verification: Optional[dict[str, Any]] = None
+    claim_evidence_map: list[dict[str, Any]] = Field(default_factory=list)
+    rag_correction_count: int = 0
+    rag_evidence: dict[str, Any] | None = None
+    rag_stages: list[dict[str, Any]] = Field(default_factory=list)
+    human_reviews: list[dict[str, Any]] = Field(default_factory=list)
+    answer_status: Literal["automatic", "pending_human_review", "review_submission_failed"] = "automatic"
 
 
 class StreamChunkType(str, Enum):
@@ -123,6 +162,9 @@ class StreamChunk(BaseModel):
     tool_args: Optional[dict[str, Any]] = None
     finish_reason: Optional[str] = None
     error: Optional[str] = None
+    session_id: str | None = None
+    human_reviews: list[dict[str, Any]] | None = None
+    answer_status: str | None = None
 
 
 class DocumentIngestRequest(BaseModel):
@@ -133,8 +175,18 @@ class DocumentIngestRequest(BaseModel):
 
 
 class LongDocumentIngestRequest(DocumentIngestRequest):
-    chunk_size: int = Field(800, ge=200, le=3000, description="单个文本块的最大字符数，入库前还会受 embedding token 上限保护")
-    chunk_overlap: int = Field(120, ge=0, le=1000, description="相邻文本块重叠字符数")
+    chunk_size: int = Field(
+        3000,
+        ge=200,
+        le=12000,
+        description="语义单元异常过大时使用的字符安全上限，不作为常规固定切分长度",
+    )
+    chunk_overlap: int = Field(
+        450,
+        ge=0,
+        le=2000,
+        description="兼容旧客户端保留；在线分块固定按前一语义 chunk 的 15% 计算 overlap",
+    )
 
 
 class DocumentBatchDeleteRequest(BaseModel):

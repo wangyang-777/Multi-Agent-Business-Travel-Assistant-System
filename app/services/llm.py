@@ -2,15 +2,14 @@ from __future__ import annotations
 
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
-from openai import AsyncOpenAI
-
 from app.config import settings
 from app.core.circuit_breaker import CircuitBreaker
+from app.utils.openai_client import create_openai_client
 
 
 class LLMService:
     def __init__(self) -> None:
-        self._client = AsyncOpenAI(
+        self._client = create_openai_client(
             api_key=settings.openai_api_key or "dummy",
             base_url=settings.openai_base_url,
         )
@@ -32,6 +31,7 @@ class LLMService:
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = "auto",
         temperature: float = 0.2,
+        response_format: dict[str, Any] | None = None,
     ) -> Any:
         async def _call() -> Any:
             kwargs: dict[str, Any] = {
@@ -42,6 +42,8 @@ class LLMService:
             if tools:
                 kwargs["tools"] = tools
                 kwargs["tool_choice"] = tool_choice
+            if response_format is not None:
+                kwargs["response_format"] = response_format
             return await self._client.chat.completions.create(**kwargs)
 
         return await self._breaker.call(_call)

@@ -7,3 +7,5 @@ __pycache__/
 .codex
 .agents/
 .git-local/
+evals/runs/
+evals/source_documents/

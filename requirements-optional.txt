@@ -1,0 +1,2 @@
+# Optional enhanced document parsers. Install after requirements.txt.
+unstructured[docx,pptx,xlsx]>=0.15.0,<1.0.0

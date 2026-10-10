@@ -27,13 +27,66 @@ class _FakeLLM:
     async def chat_completion(self, messages, **kwargs):  # type: ignore[no-untyped-def]
         self.calls += 1
         self.messages.append(messages)
+        content = (
+            '{"primary_intent":"general","tasks":[{"id":"task_1",'
+            '"intent":"general","request":"你好","slots":{},'
+            '"depends_on":[],"missing_slots":[]}],"clarification_question":null}'
+            if kwargs.get("response_format") else "图编排回复"
+        )
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
                     message=SimpleNamespace(
-                        content="图编排回复",
+                        content=content,
                         tool_calls=None,
                     )
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5),
+        )
+
+
+class _RetryFlowLLM:
+    model = "fake-model"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat_completion(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        if self.calls == 1:
+            content = (
+                '{"primary_intent":"trip_planning","tasks":[{"id":"task_1",'
+                '"intent":"trip_planning",'
+                '"request":"我是staff，请推荐2026-10-20从北京到上海的航班、高铁和酒店",'
+                '"slots":{"employee_id":"u1","grade":"staff",'
+                '"origin_city":"北京","destination_city":"上海",'
+                '"departure_date":"2026-10-20"},'
+                '"depends_on":[],"missing_slots":[]}],"clarification_question":null}'
+            )
+            tool_calls = None
+        elif self.calls in {2, 4}:
+            content = None
+            tool_calls = [
+                SimpleNamespace(
+                    id=f"tc-{self.calls}",
+                    function=SimpleNamespace(
+                        name="recommend_travel_options",
+                        arguments=(
+                            '{"employee_id":"u1","grade":"staff",'
+                            '"origin_city":"北京","destination_city":"上海",'
+                            '"departure_date":"2026-10-20"}'
+                        ),
+                    ),
+                )
+            ]
+        else:
+            content = "当前没有找到满足条件的完整候选。"
+            tool_calls = None
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=content, tool_calls=tool_calls)
                 )
             ],
             usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5),
@@ -67,9 +120,9 @@ async def test_langgraph_orchestrator_keeps_chat_response_shape() -> None:
     assert result["model"] == "fake-model"
     assert result["choices"][0]["message"]["content"] == "图编排回复"
     assert result["usage"] == {
-        "prompt_tokens": 2,
-        "completion_tokens": 3,
-        "total_tokens": 5,
+        "prompt_tokens": 4,
+        "completion_tokens": 6,
+        "total_tokens": 10,
     }
     assert result["metadata"]["orchestrator"] == "langgraph"
     assert result["metadata"]["trace"]
@@ -194,6 +247,159 @@ def test_policy_validation_checks_booking_draft_against_constraints() -> None:
     assert any("需提交审批" in item for item in validation["warnings"])
 
 
+@pytest.mark.asyncio
+async def test_validation_failure_schedules_one_travel_retry() -> None:
+    orch = LangGraphTravelOrchestrator(llm=_FakeLLM())
+    state = {
+        "travel_attempt": 1,
+        "travel_retry_count": 0,
+        "tool_trace": [
+            {
+                "attempt": 1,
+                "tool": "recommend_travel_options",
+                "arguments": "{}",
+                "output": (
+                    '{"mode":"travel_recommendation",'
+                    '"flights":[{"flight_no":"CA1"}],'
+                    '"hotels":[{"name":"H1"}]}'
+                ),
+            }
+        ],
+        "booking_draft": {"recommended_hotel": {"name": "H1", "nightly_cny": "960"}},
+        "policy_validation": {
+            "status": "failed",
+            "checks": [
+                {
+                    "name": "酒店差标",
+                    "status": "failed",
+                    "detail": "酒店每晚 960 CNY 超过制度上限 800 CNY",
+                }
+            ],
+            "warnings": [],
+            "violations": ["酒店每晚 960 CNY 超过制度上限 800 CNY"],
+        },
+        "trace": [],
+    }
+
+    command = await orch._travel_retry_router(state)  # type: ignore[arg-type]
+
+    assert command.goto == "travel_react_agent"
+    assert command.update["travel_retry_count"] == 1
+    assert command.update["travel_retry_feedback"]["previous_attempt"] == 1
+
+
+@pytest.mark.asyncio
+async def test_second_failed_attempt_requires_manual_review() -> None:
+    orch = LangGraphTravelOrchestrator(llm=_FakeLLM())
+    state = {
+        "messages": [ChatMessage(role=MessageRole.USER, content="帮我推荐合规差旅行程")],
+        "effective_messages": [ChatMessage(role=MessageRole.USER, content="帮我推荐合规差旅行程")],
+        "answer": "没有找到合适方案",
+        "travel_attempt": 2,
+        "travel_retry_count": 1,
+        "tool_trace": [
+            {
+                "attempt": 1,
+                "tool": "recommend_travel_options",
+                "arguments": "{}",
+                "output": '{"mode":"travel_recommendation","flights":[],"hotels":[]}',
+            },
+            {
+                "attempt": 2,
+                "tool": "recommend_travel_options",
+                "arguments": "{}",
+                "output": '{"mode":"travel_recommendation","flights":[],"trains":[],"hotels":[]}',
+            },
+        ],
+        "booking_draft": None,
+        "policy_validation": {
+            "status": "needs_review",
+            "summary": "未找到完整候选，需人工复核。",
+            "checks": [],
+            "warnings": ["候选为空"],
+            "violations": [],
+        },
+        "trace": [],
+    }
+
+    command = await orch._travel_retry_router(state)  # type: ignore[arg-type]
+
+    assert command.goto == "approval_processor"
+    assert command.update["travel_retry_exhausted"] is True
+    assert command.update["risk_level"] == "high"
+    assert command.update["policy_validation"]["retry"]["exhausted"] is True
+    assert "转人工审核" in command.update["answer"]
+
+    approval_state = {**state, **command.update}
+    approval = await orch._approval_processor(approval_state)  # type: ignore[arg-type]
+    assert approval.update["approval_form"]["required"] is True
+    assert approval.update["approval_form"]["status"] == "pending_human_approval"
+
+
+@pytest.mark.asyncio
+async def test_passed_retry_continues_without_exhaustion() -> None:
+    orch = LangGraphTravelOrchestrator(llm=_FakeLLM())
+    state = {
+        "travel_attempt": 2,
+        "travel_retry_count": 1,
+        "tool_trace": [
+            {
+                "attempt": 2,
+                "tool": "recommend_travel_options",
+                "arguments": "{}",
+                "output": (
+                    '{"mode":"travel_recommendation",'
+                    '"flights":[{"flight_no":"CA2"}],'
+                    '"hotels":[{"name":"H2","nightly_cny":"700"}]}'
+                ),
+            }
+        ],
+        "booking_draft": {"recommended_hotel": {"name": "H2", "nightly_cny": "700"}},
+        "policy_validation": {
+            "status": "passed",
+            "checks": [{"name": "酒店差标", "status": "passed", "detail": "符合标准"}],
+            "warnings": [],
+            "violations": [],
+        },
+        "trace": [],
+    }
+
+    command = await orch._travel_retry_router(state)  # type: ignore[arg-type]
+
+    assert command.goto == "approval_processor"
+    assert command.update["travel_retry_exhausted"] is False
+
+
+def test_booking_draft_uses_only_latest_retry_attempt() -> None:
+    state = {
+        "travel_attempt": 2,
+        "tool_trace": [
+            {
+                "attempt": 1,
+                "arguments": "{}",
+                "output": (
+                    '{"mode":"travel_recommendation","policy_warnings":["旧候选不合规"],'
+                    '"recommendation":{"hotel":{"name":"旧酒店","nightly_cny":"960"}}}'
+                ),
+            },
+            {
+                "attempt": 2,
+                "arguments": "{}",
+                "output": (
+                    '{"mode":"travel_recommendation","policy_warnings":[],'
+                    '"recommendation":{"hotel":{"name":"新酒店","nightly_cny":"700"}}}'
+                ),
+            },
+        ],
+    }
+
+    draft = LangGraphTravelOrchestrator._build_booking_draft(state)  # type: ignore[arg-type]
+
+    assert draft is not None
+    assert draft["recommended_hotel"]["name"] == "新酒店"
+    assert "旧候选不合规" not in draft["policy_warnings"]
+
+
 def test_heuristic_policy_constraints_extracts_common_rules() -> None:
     result = LangGraphTravelOrchestrator._heuristic_policy_constraints(
         [
@@ -213,37 +419,32 @@ def test_heuristic_policy_constraints_extracts_common_rules() -> None:
     assert result["constraints"]["cabin_limit"] == "economy"
 
 
-def test_reliable_citation_detection() -> None:
-    assert LangGraphTravelOrchestrator._has_reliable_citations(
-        "staff 去上海酒店标准是多少？",
-        [{"title": "policy-hotel-tier1", "content": "staff 员工去上海酒店标准为 800 CNY"}],
-    )
-    assert not LangGraphTravelOrchestrator._has_reliable_citations(
-        "高级员工去济南高铁标准是什么？",
-        [{"title": "policy-hotel-tier1", "content": "staff 员工去上海酒店标准为 800 CNY"}],
-    )
+@pytest.mark.asyncio
+async def test_retrieved_table_proceeds_without_keyword_gate(monkeypatch) -> None:
+    orch = LangGraphTravelOrchestrator(llm=_FakeLLM(), document_store=_FakeStore([
+        {"id": "row", "content": "| 级别 | 飞机 |\n| A级 | 公务舱 |"}
+    ]))
+    monkeypatch.setattr("app.agent.langgraph_orchestrator.EmbeddingService", _FakeEmbedder)
+    state = {"messages": [ChatMessage(role=MessageRole.USER, content="A级飞机舱位标准是什么？")], "trace": []}
+    result = await orch._rag_responder(state)
+    assert result.goto == "rag_evidence_builder"
+    assert result.update["citations"][0]["chunk_id"] == "row"
 
 
-def test_verification_flags_unsupported_rag_terms() -> None:
-    result = LangGraphTravelOrchestrator._verify_answer_grounding(
-        "staff 去上海酒店标准为 900 CNY，需要审批。",
-        [{"title": "policy-hotel-tier1", "content": "staff 去上海酒店标准为 800 CNY。"}],
-        "rag_grounded",
-    )
-
-    assert result["passed"] is False
-    assert "900 CNY" in result["unsupported_terms"]
+@pytest.mark.asyncio
+async def test_missing_evidence_state_cannot_pass_rag_verification() -> None:
+    orch = LangGraphTravelOrchestrator(llm=_FakeLLM())
+    result = await orch._grounding_verifier({"answer": "金额900元", "answer_mode": "rag_grounded"})
+    assert result.goto == "response_finalizer"
+    assert result.update["verification"]["passed"] is False
 
 
-def test_verification_skips_llm_fallback() -> None:
-    result = LangGraphTravelOrchestrator._verify_answer_grounding(
-        "未检索到公司制度依据，以下为通用建议。",
-        [],
-        "llm_fallback",
-    )
-
-    assert result["passed"] is True
-    assert result["reason"] == "non_rag_answer"
+@pytest.mark.asyncio
+async def test_non_rag_verification_is_explicitly_skipped() -> None:
+    orch = LangGraphTravelOrchestrator(llm=_FakeLLM())
+    result = await orch._grounding_verifier({"answer": "你好", "answer_mode": None})
+    assert result.update["verification"]["passed"] is None
+    assert result.update["verification"]["status"] == "skipped"
 
 
 @pytest.mark.asyncio
@@ -262,3 +463,41 @@ async def test_memory_fusion_persists_long_term_user_facts() -> None:
     first_call_messages = llm.messages[0]
     memory_prompts = [m["content"] for m in first_call_messages if m["role"] == "system"]
     assert any("公司制度/RAG 引用 > 当前用户明确输入" in text for text in memory_prompts)
+
+
+@pytest.mark.asyncio
+async def test_graph_retries_after_validation_then_requires_manual_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm = _RetryFlowLLM()
+    orch = LangGraphTravelOrchestrator(llm=llm)
+
+    async def empty_recommendation(name: str, arguments: str, user_text: str = "") -> str:
+        assert name == "recommend_travel_options"
+        return (
+            '{"mode":"travel_recommendation","query":'
+            '{"employee_id":"u1","grade":"staff","origin_city":"北京",'
+            '"destination_city":"上海","departure_date":"2026-10-20"},'
+            '"flights":[],"trains":[],"hotels":[],"policy_warnings":[],'
+            '"recommendation":{"flight":null,"train":null,"hotel":null}}'
+        )
+
+    monkeypatch.setattr(orch, "_execute_tool", empty_recommendation)
+
+    result = await orch.run_completion(
+        [
+            ChatMessage(
+                role=MessageRole.USER,
+                content="我是staff，请推荐2026-10-20从北京到上海的航班、高铁和酒店",
+            )
+        ]
+    )
+
+    metadata = result["metadata"]
+    assert metadata["travel_retry"]["attempts"] == 2
+    assert metadata["travel_retry"]["retry_count"] == 1
+    assert metadata["travel_retry"]["exhausted"] is True
+    assert [item["attempt"] for item in metadata["tool_trace"]] == [1, 2]
+    assert metadata["risk_level"] == "high"
+    assert metadata["approval_form"]["required"] is True
+    assert metadata["approval_form"]["status"] == "pending_human_approval"
